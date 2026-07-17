@@ -1,0 +1,215 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.airlift.classfile;
+
+import org.junit.jupiter.api.Test;
+
+import java.lang.constant.ClassDesc;
+import java.lang.invoke.MethodHandles;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static io.airlift.classfile.BytecodeExpressions.constantInt;
+import static io.airlift.classfile.BytecodeExpressions.constantLong;
+import static io.airlift.classfile.BytecodeExpressions.newArray;
+import static io.airlift.classfile.ClassfileTestUtils.defineHidden;
+import static java.lang.constant.ConstantDescs.CD_Object;
+import static java.lang.constant.ConstantDescs.CD_int;
+import static java.lang.reflect.AccessFlag.FINAL;
+import static java.lang.reflect.AccessFlag.PUBLIC;
+import static java.lang.reflect.AccessFlag.STATIC;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class TestSyntheticExpressions
+{
+    private static final AtomicLong NEXT_CLASS_ID = new AtomicLong();
+
+    @Test
+    void testStructuredExpressionIsFluentAndReusable()
+            throws Exception
+    {
+        ClassDefinition classDefinition = ClassDefinition.define(generatedClass("Synthetic")).access(PUBLIC, FINAL);
+        Parameter input = Parameter.arg("input", int.class);
+        MethodDefinition method = classDefinition.method("value", CD_int, input).access(PUBLIC, STATIC);
+        SyntheticExpression expression = new AddThenDouble(input);
+
+        assertThat(expression.toString()).isEqualTo("addThenDouble(input)");
+        assertThat(expression.add(constantInt(3)).toString()).isEqualTo("(addThenDouble(input) + 3)");
+        SyntheticExpression offset = new Offset(input);
+        assertThat(offset.toString()).isEqualTo("offset(input)");
+        method.body().append(expression.add(expression).add(offset).ret());
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledClass compiledClass = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileClass(classDefinition.build());
+        Class<?> generated = defineHidden(lookup, compiledClass).lookupClass();
+        assertThat(generated.getMethod("value", int.class).invoke(null, 5)).isEqualTo(30);
+    }
+
+    @Test
+    void testInvalidExpansionFailsDuringDefinitionAssembly()
+    {
+        ClassDefinition wrongTypeClass = ClassDefinition.define(generatedClass("WrongType"));
+        MethodDefinition wrongType = wrongTypeClass.method("value", CD_int).access(PUBLIC, STATIC);
+        wrongType.body().append(new WrongTypeExpression().ret());
+        assertThatThrownBy(wrongTypeClass::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Expansion value type long does not match expression type int");
+
+        ClassDefinition recursiveClass = ClassDefinition.define(generatedClass("Recursive"));
+        MethodDefinition recursive = recursiveClass.method("value", CD_int).access(PUBLIC, STATIC);
+        recursive.body().append(new RecursiveExpression().ret());
+        assertThatThrownBy(recursiveClass::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Synthetic expression expands to itself: recursive");
+    }
+
+    @Test
+    void testExpansionContextCreatesRuntimeBoundConstants()
+            throws Exception
+    {
+        Object classTyped = new Object();
+        Object descriptorTyped = new Object();
+        ClassDefinition definition = ClassDefinition.define(generatedClass("BoundContext")).access(PUBLIC, FINAL);
+        MethodDefinition method = definition.method("values", Object[].class).access(PUBLIC, STATIC);
+        method.body().ret(newArray(Object[].class, List.of(
+                new ContextBoundConstant(classTyped, false),
+                new ContextBoundConstant(descriptorTyped, true))));
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledClass compiledClass = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileClass(definition.build());
+        Class<?> generated = defineHidden(lookup, compiledClass).lookupClass();
+        assertThat((Object[]) generated.getMethod("values").invoke(null)).containsExactly(classTyped, descriptorTyped);
+    }
+
+    private static ClassDesc generatedClass(String suffix)
+    {
+        return ClassDesc.of(TestSyntheticExpressions.class.getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
+    }
+
+    private record AddThenDouble(BytecodeExpression input)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable temporary = setup.declare(CD_int, "temporary");
+            setup.append(temporary.set(input.add(constantInt(1))));
+            return new ExpressionPlan(setup.build(), temporary.multiply(constantInt(2)));
+        }
+
+        @Override
+        public String toString()
+        {
+            return "addThenDouble(" + input + ")";
+        }
+    }
+
+    private record Offset(BytecodeExpression input)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return ExpressionPlan.value(input.add(constantInt(1)));
+        }
+
+        @Override
+        public String toString()
+        {
+            return "offset(" + input + ")";
+        }
+    }
+
+    private static final class WrongTypeExpression
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return ExpressionPlan.value(constantLong(1));
+        }
+
+        @Override
+        public String toString()
+        {
+            return "wrongType";
+        }
+    }
+
+    private static final class RecursiveExpression
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return ExpressionPlan.value(this);
+        }
+
+        @Override
+        public String toString()
+        {
+            return "recursive";
+        }
+    }
+
+    private record ContextBoundConstant(Object value, boolean symbolicType)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_Object;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return ExpressionPlan.value(symbolicType
+                    ? context.boundConstant(value, CD_Object)
+                    : context.boundConstant(value, Object.class));
+        }
+
+        @Override
+        public String toString()
+        {
+            return "contextBoundConstant";
+        }
+    }
+}
