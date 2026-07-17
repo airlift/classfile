@@ -1,2 +1,23 @@
 <FindBugsFilter>
+    <!-- Variable instances are immutable identity keys for lexical binding. -->
+    <Match>
+        <Class name="io.airlift.classfile.ExpressionNode$SetVariable" />
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2" />
+    </Match>
+    <Match>
+        <Class name="io.airlift.classfile.ExpressionNode$Increment" />
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2" />
+    </Match>
+    <Match>
+        <Class name="io.airlift.classfile.MethodDefinition" />
+        <Bug pattern="EI_EXPOSE_REP" />
+    </Match>
+    <Match>
+        <Class name="io.airlift.classfile.MethodDefinition$Model" />
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2" />
+    </Match>
+    <Match>
+        <Class name="io.airlift.classfile.TryCatch$CatchClause" />
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2" />
+    </Match>
 </FindBugsFilter>
