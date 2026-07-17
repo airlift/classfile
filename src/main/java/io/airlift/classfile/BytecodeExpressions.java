@@ -175,7 +175,10 @@ public final class BytecodeExpressions
     /// constant pool. The declared type must be visible from the compilation target.
     public static BytecodeExpression boundConstant(Object value, Class<?> type)
     {
-        return boundConstant(value, classDesc(type));
+        requireNonNull(type, "type is null");
+        ClassDesc descriptor = classDesc(type);
+        requireReference(descriptor, "type");
+        return boundConstant(type.cast(requireNonNull(value, "value is null")), descriptor);
     }
 
     /// Binds an object by identity using a symbolic declared type that need not yet be loaded.
@@ -412,6 +415,11 @@ public final class BytecodeExpressions
     static BytecodeExpression invokeVirtual(BytecodeExpression target, ClassDesc owner, String name, MethodTypeDesc methodType, BytecodeExpression... arguments)
     {
         return invoke(ExpressionNode.InvocationKind.VIRTUAL, target, owner, name, methodType, arguments);
+    }
+
+    static BytecodeExpression invokeVirtualOrInterface(BytecodeExpression target, ClassDesc owner, String name, MethodTypeDesc methodType, BytecodeExpression... arguments)
+    {
+        return invoke(ExpressionNode.InvocationKind.VIRTUAL_OR_INTERFACE, target, owner, name, methodType, arguments);
     }
 
     static BytecodeExpression invokeInterface(BytecodeExpression target, ClassDesc owner, String name, MethodTypeDesc methodType, BytecodeExpression... arguments)

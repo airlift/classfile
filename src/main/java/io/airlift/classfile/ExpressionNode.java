@@ -334,6 +334,7 @@ sealed interface ExpressionNode
     enum InvocationKind
     {
         STATIC,
+        VIRTUAL_OR_INTERFACE,
         VIRTUAL,
         INTERFACE,
         SPECIAL,

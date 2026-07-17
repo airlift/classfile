@@ -200,7 +200,7 @@ public sealed interface BytecodeExpression
 
     default BytecodeExpression invoke(String name, MethodTypeDesc methodType, BytecodeExpression... arguments)
     {
-        return invokeVirtual(type(), name, methodType, arguments);
+        return BytecodeExpressions.invokeVirtualOrInterface(this, type(), name, methodType, arguments);
     }
 
     default BytecodeExpression invoke(String name, Class<?> returnType, BytecodeExpression... arguments)

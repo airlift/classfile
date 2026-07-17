@@ -29,12 +29,17 @@ import static java.lang.constant.DirectMethodHandleDesc.Kind.STATIC;
 
 final class BootstrapDescriptors
 {
-    private static final ClassDesc RUNTIME_BOOTSTRAPS = ClassDesc.of("io.airlift.classfile.runtime.RuntimeBootstraps");
+    private static final ClassDesc RUNTIME_BOOTSTRAPS = ClassDesc.of(RuntimeBootstraps.class.getName());
     private static final DirectMethodHandleDesc BINDING_CONSTANT = MethodHandleDesc.ofMethod(
             STATIC,
             RUNTIME_BOOTSTRAPS,
             "bindingConstant",
             MethodTypeDesc.of(CD_Object, CD_MethodHandles_Lookup, CD_String, CD_Class, CD_int));
+    private static final DirectMethodHandleDesc BINDING_CALL_SITE = MethodHandleDesc.ofMethod(
+            STATIC,
+            RUNTIME_BOOTSTRAPS,
+            "bindingCallSite",
+            MethodTypeDesc.of(CD_CallSite, CD_MethodHandles_Lookup, CD_String, CD_MethodType, CD_int));
     private static final DirectMethodHandleDesc CLASS_DATA_CONSTANT = MethodHandleDesc.ofMethod(
             STATIC,
             RUNTIME_BOOTSTRAPS,
@@ -58,6 +63,11 @@ final class BootstrapDescriptors
     static DirectMethodHandleDesc bindingConstant()
     {
         return BINDING_CONSTANT;
+    }
+
+    static DirectMethodHandleDesc bindingCallSite()
+    {
+        return BINDING_CALL_SITE;
     }
 
     static DirectMethodHandleDesc classDataConstant()
