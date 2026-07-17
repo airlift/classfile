@@ -22,6 +22,7 @@ import java.lang.classfile.Signature;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
 import java.lang.reflect.AccessFlag;
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -261,6 +262,24 @@ class TestBuilderPolicy
         assertAlreadySet(
                 () -> classDefinition.superClass(Object.class),
                 "super class cannot be set after the default constructor is declared");
+    }
+
+    @Test
+    void testRuntimeDataPublicApiDoesNotExposeCompilerBindings()
+    {
+        assertThat(RuntimeData.class.getConstructors()).isEmpty();
+        assertThat(RuntimeData.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("binding", "bindings");
+        assertThat(CompiledClass.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("runtimeData");
+        assertThat(CompiledClassBundle.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("runtimeData");
+
+        Object classData = new Object();
+        assertThat(RuntimeData.ofClassData(classData).classData()).containsSame(classData);
     }
 
     private static void assertAlreadySet(Runnable action, String message)
