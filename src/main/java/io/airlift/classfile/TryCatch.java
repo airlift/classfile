@@ -67,6 +67,14 @@ public final class TryCatch
         return description;
     }
 
+    TryCatch rewrite(CodeBlock tryBlock, List<CatchClause> catches, Optional<CodeBlock> finallyBlock)
+    {
+        if (this.tryBlock == tryBlock && this.catches.equals(catches) && this.finallyBlock.equals(finallyBlock)) {
+            return this;
+        }
+        return new TryCatch(tryBlock, catches, finallyBlock, description);
+    }
+
     @Override
     public String toString()
     {

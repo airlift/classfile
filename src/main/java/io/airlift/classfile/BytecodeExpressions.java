@@ -195,6 +195,27 @@ public final class BytecodeExpressions
         return new BoundMethodHandle(handle);
     }
 
+    static BytecodeExpression invokeLinked(MethodDefinition method, BytecodeExpression... arguments)
+    {
+        requireNonNull(method, "method is null");
+        if (!method.isStatic()) {
+            throw new IllegalArgumentException("Linked method must be static: " + method);
+        }
+        List<BytecodeExpression> argumentList = List.of(requireNonNull(arguments, "arguments is null"));
+        List<ClassDesc> parameterTypes = method.methodType().parameterList();
+        if (argumentList.size() != parameterTypes.size()) {
+            throw new IllegalArgumentException("Expected %s arguments but got %s for %s".formatted(parameterTypes.size(), argumentList.size(), method));
+        }
+        for (int index = 0; index < argumentList.size(); index++) {
+            if (!argumentList.get(index).type().equals(parameterTypes.get(index))) {
+                throw new IllegalArgumentException("Argument %s has type %s but %s requires %s"
+                        .formatted(index, argumentList.get(index).type().displayName(), method, parameterTypes.get(index).displayName()));
+            }
+        }
+        CompiledUnit.LinkedMethod link = new CompiledUnit.LinkedMethod(method.declaringType(), method.name(), method.methodType());
+        return core(new ExpressionNode.LinkedMethodInvocation(method.returnType(), link, argumentList));
+    }
+
     /// Reads the caller-supplied class-data value associated with the generated class.
     public static BytecodeExpression classData(Class<?> type)
     {

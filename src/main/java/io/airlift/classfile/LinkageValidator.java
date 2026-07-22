@@ -262,6 +262,7 @@ final class LinkageValidator
                 case ExpressionNode.BoundMethodHandleInvocation _ -> {
                     // The original handle signature is deliberately replaced with a target-accessible signature.
                 }
+                case ExpressionNode.LinkedMethodInvocation linked -> methodType(linked.method().type(), location + " linked method descriptor");
                 case ExpressionNode.InvokeDynamic invokeDynamic -> dynamicCallSite(invokeDynamic.callSite(), location);
                 case ExpressionNode.SetVariable setVariable -> type(setVariable.variable().type(), location + " local " + setVariable.variable().name());
                 case ExpressionNode.Increment increment -> type(increment.variable().type(), location + " local " + increment.variable().name());

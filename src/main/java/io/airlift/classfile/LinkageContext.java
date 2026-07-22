@@ -15,7 +15,10 @@ package io.airlift.classfile;
 
 import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.constant.ClassDesc;
+import java.lang.constant.MethodTypeDesc;
 import java.lang.invoke.MethodHandle;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -120,6 +123,58 @@ final class LinkageContext
     {
         return ClassHierarchyResolver.ClassHierarchyInfo.ofInterface()
                 .equals(hierarchyResolver.getClassInfo(requireNonNull(type, "type is null")));
+    }
+
+    boolean isPublicMethod(ClassDesc owner, String name, MethodTypeDesc methodType)
+    {
+        ClassModel generatedDefinition = generatedDefinitions.get(owner);
+        if (generatedDefinition != null) {
+            return generatedDefinition.methods().stream()
+                    .anyMatch(method -> method.name().equals(name) && method.methodType().equals(methodType) && method.access().contains(PUBLIC));
+        }
+        return target.resolveClass(owner)
+                .stream()
+                .flatMap(type -> Arrays.stream(type.getMethods()))
+                .anyMatch(method -> method.getName().equals(name) && DescriptorUtils.methodType(method).equals(methodType));
+    }
+
+    boolean isCallerSensitiveMethod(ClassDesc owner, String name, MethodTypeDesc methodType)
+    {
+        if (generatedDefinitions.containsKey(owner)) {
+            return false;
+        }
+        return target.resolveClass(owner)
+                .stream()
+                .flatMap(type -> Arrays.stream(type.getMethods()))
+                .filter(method -> method.getName().equals(name) && DescriptorUtils.methodType(method).equals(methodType))
+                .flatMap(method -> Arrays.stream(method.getDeclaredAnnotations()))
+                .anyMatch(annotation -> annotation.annotationType().getName().equals("jdk.internal.reflect.CallerSensitive"));
+    }
+
+    boolean isPublicField(ClassDesc owner, String name, ClassDesc fieldType)
+    {
+        ClassModel generatedDefinition = generatedDefinitions.get(owner);
+        if (generatedDefinition != null) {
+            return generatedDefinition.fields().stream()
+                    .anyMatch(field -> field.name().equals(name) && field.type().equals(fieldType) && field.access().contains(PUBLIC));
+        }
+        return target.resolveClass(owner)
+                .stream()
+                .flatMap(type -> Arrays.stream(type.getFields()))
+                .anyMatch(field -> field.getName().equals(name) && DescriptorUtils.classDesc(field.getType()).equals(fieldType));
+    }
+
+    boolean isPublicConstructor(ClassDesc owner, MethodTypeDesc constructorType)
+    {
+        ClassModel generatedDefinition = generatedDefinitions.get(owner);
+        if (generatedDefinition != null) {
+            return generatedDefinition.methods().stream()
+                    .anyMatch(method -> method.name().equals("<init>") && method.methodType().equals(constructorType) && method.access().contains(PUBLIC));
+        }
+        return target.resolveClass(owner)
+                .stream()
+                .flatMap(type -> Arrays.stream(type.getConstructors()))
+                .anyMatch(constructor -> DescriptorUtils.methodType(constructor).equals(constructorType) && Modifier.isPublic(constructor.getModifiers()));
     }
 
     void requireAccessible(ClassDesc type, ClassModel definition, String location)

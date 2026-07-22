@@ -14,13 +14,22 @@
 package io.airlift.classfile;
 
 import java.lang.constant.ClassDesc;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
 
 /// Defines nominal generated classes in a dedicated generated class loader.
+///
+/// Compile for this definer's [StandardClassDefiner#compilationTarget()] so visibility and runtime
+/// package checks reflect the loader that will define the classes.
 ///
 /// A definer is safe to share across threads within a bounded generation scope. Every class
 /// defined through one instance shares its generated loader and therefore its unloading lifetime;
@@ -41,17 +50,19 @@ public final class StandardClassDefiner
         return new Builder(parent);
     }
 
-    /// Returns the target describing the generated class loader used by this definer.
+    /// Returns the target describing the generated class loader used by this definer. Compile a
+    /// [CompiledUnit] for this target before passing it to [StandardClassDefiner#defineUnit(CompiledUnit)].
     public CompilationTarget compilationTarget()
     {
         return CompilationTarget.forClassLoader(classLoader);
     }
 
+    /// Compiles and defines one model as a nominal class using this definer's target.
     public Class<?> defineClass(ClassModel definition)
     {
         requireNonNull(definition, "definition is null");
         RuntimeData configuredRuntimeData = classLoader.configuredRuntimeData();
-        ClassCompiler compiler = ClassCompiler.forTarget(CompilationTarget.forClassLoader(classLoader));
+        ClassCompiler compiler = ClassCompiler.forTarget(compilationTarget());
         if (configuredRuntimeData.classData().isPresent()) {
             compiler = compiler.classData(configuredRuntimeData.classData().orElseThrow());
         }
@@ -64,11 +75,12 @@ public final class StandardClassDefiner
         return defineClass(definition).asSubclass(requireNonNull(superType, "superType is null"));
     }
 
+    /// Compiles and defines explicitly authored nominal classes in the same generated class loader.
     public DefinedClasses defineClasses(List<ClassModel> definitions)
     {
         requireNonNull(definitions, "definitions is null");
         RuntimeData configuredRuntimeData = classLoader.configuredRuntimeData();
-        ClassCompiler compiler = ClassCompiler.forTarget(CompilationTarget.forClassLoader(classLoader));
+        ClassCompiler compiler = ClassCompiler.forTarget(compilationTarget());
         if (configuredRuntimeData.classData().isPresent()) {
             compiler = compiler.classData(configuredRuntimeData.classData().orElseThrow());
         }
@@ -76,26 +88,88 @@ public final class StandardClassDefiner
         return defineCompiledClasses(compiledClasses);
     }
 
+    /// Defines an already compiled nominal class. The artifact must have been compiled for this
+    /// definer's target.
     public Class<?> defineCompiledClass(CompiledClass compiledClass)
     {
         requireNonNull(compiledClass, "compiledClass is null");
         compiledClass.target().requireCompatibleWith(compilationTarget());
         RuntimeData effectiveRuntimeData = RuntimeData.merge(classLoader.configuredRuntimeData(), compiledClass.runtimeData());
         compiledClass.validateRuntimeData(effectiveRuntimeData);
-        return defineClassfiles(Map.of(compiledClass.type(), compiledClass.classfile()), effectiveRuntimeData)
+        return defineClassfiles(
+                Map.of(compiledClass.type(), compiledClass.classfile()),
+                Map.of(compiledClass.type(), effectiveRuntimeData))
                 .definedClass(compiledClass.type());
     }
 
+    /// Defines an already compiled nominal bundle in the same generated class loader.
     public DefinedClasses defineCompiledClasses(CompiledClassBundle compiledClasses)
     {
         requireNonNull(compiledClasses, "compiledClasses is null");
         compiledClasses.target().requireCompatibleWith(compilationTarget());
         RuntimeData effectiveRuntimeData = RuntimeData.merge(classLoader.configuredRuntimeData(), compiledClasses.runtimeData());
         compiledClasses.validateRuntimeData(effectiveRuntimeData);
-        return defineClassfiles(compiledClasses.classfiles(), effectiveRuntimeData);
+        LinkedHashMap<ClassDesc, RuntimeData> runtimeData = new LinkedHashMap<>();
+        compiledClasses.types().forEach(type -> runtimeData.put(type, effectiveRuntimeData));
+        return defineClassfiles(compiledClasses.classfiles(), runtimeData);
     }
 
-    private DefinedClasses defineClassfiles(Map<ClassDesc, byte[]> classfiles, RuntimeData runtimeData)
+    /// Defines every physical class in dependency order and returns the primary class. The unit
+    /// must have been compiled for this definer's target.
+    public DefinedUnit defineUnit(CompiledUnit unit)
+    {
+        requireNonNull(unit, "unit is null");
+        unit.target().requireCompatibleWith(compilationTarget());
+        RuntimeData configuredRuntimeData = classLoader.configuredRuntimeData();
+        unit.validateConfiguredRuntimeData(configuredRuntimeData);
+        LinkedHashMap<ClassDesc, byte[]> classfiles = new LinkedHashMap<>();
+        unit.types().forEach(type -> classfiles.put(type, unit.classfile(type)));
+        GeneratedClassLoader.Reservation reservation = classLoader.reserve(classfiles, Map.of());
+
+        boolean completed = false;
+        try {
+            Map<CompiledUnit.LinkedMethod, MethodHandle> linkedMethods = new LinkedHashMap<>();
+            Map<ClassDesc, Class<?>> classes = new LinkedHashMap<>();
+            for (ClassDesc type : unit.definitionOrder()) {
+                RuntimeData compiledRuntimeData = unit.runtimeData(type, method -> {
+                    MethodHandle handle = linkedMethods.get(method);
+                    if (handle == null) {
+                        throw new IllegalStateException("Generated method was not linked before its caller: " + method);
+                    }
+                    return handle;
+                });
+                RuntimeData effectiveRuntimeData = RuntimeData.merge(configuredRuntimeData, compiledRuntimeData);
+                unit.validateRuntimeData(type, effectiveRuntimeData);
+                classLoader.setRuntimeData(reservation, type, effectiveRuntimeData);
+                Class<?> definedClass;
+                try {
+                    definedClass = Class.forName(binaryName(type), initialize, classLoader);
+                }
+                catch (ClassNotFoundException e) {
+                    throw new IllegalStateException("Unable to define generated class " + type.displayName(), e);
+                }
+                classes.put(type, definedClass);
+                for (CompiledUnit.LinkedMethod method : unit.linkedMethodsOwnedBy(type)) {
+                    try {
+                        MethodType methodType = MethodType.fromMethodDescriptorString(method.type().descriptorString(), definedClass.getClassLoader());
+                        linkedMethods.put(method, MethodHandles.publicLookup().findStatic(definedClass, method.name(), methodType));
+                    }
+                    catch (NoSuchMethodException | IllegalAccessException e) {
+                        throw new IllegalStateException("Unable to link generated method " + method, e);
+                    }
+                }
+            }
+            completed = true;
+            return new DefinedUnit(unit.primaryType(), classes, Map.of());
+        }
+        finally {
+            if (!completed) {
+                classLoader.releasePending(reservation);
+            }
+        }
+    }
+
+    private DefinedClasses defineClassfiles(Map<ClassDesc, byte[]> classfiles, Map<ClassDesc, RuntimeData> runtimeData)
     {
         requireNonNull(classfiles, "classfiles is null");
         GeneratedClassLoader.Reservation reservation = classLoader.reserve(classfiles, requireNonNull(runtimeData, "runtimeData is null"));
@@ -121,6 +195,7 @@ public final class StandardClassDefiner
         }
     }
 
+    /// Set-once configuration for nominal-class definition.
     public static final class Builder
     {
         private final ClassLoader parent;
@@ -177,45 +252,70 @@ public final class StandardClassDefiner
         }
     }
 
-    @SuppressWarnings("BanClassLoader") // This loader exists specifically to define compiler-produced bytecode.
+    /// Defines only bytecode produced by this compiler and never accepts serialized or
+    /// otherwise untrusted classfile input.
+    @SuppressWarnings("BanClassLoader")
     private static final class GeneratedClassLoader
             extends ClassLoader
             implements RuntimeDataProvider
     {
         private final ClassLoader overrideLoader;
-        private RuntimeData runtimeData;
-        private final Map<String, byte[]> pending = new LinkedHashMap<>();
+        private final RuntimeData configuredRuntimeData;
+        private final Map<String, RuntimeData> runtimeData = new HashMap<>();
+        private final Map<String, PendingClass> pending = new HashMap<>();
 
         private GeneratedClassLoader(ClassLoader parent, ClassLoader overrideLoader, RuntimeData runtimeData)
         {
             super(parent);
             this.overrideLoader = overrideLoader;
-            this.runtimeData = runtimeData;
+            this.configuredRuntimeData = runtimeData;
         }
 
-        private synchronized Reservation reserve(Map<ClassDesc, byte[]> classfiles, RuntimeData runtimeData)
+        private synchronized Reservation reserve(Map<ClassDesc, byte[]> classfiles, Map<ClassDesc, RuntimeData> runtimeData)
         {
             requireNonNull(classfiles, "classfiles is null");
             requireNonNull(runtimeData, "runtimeData is null");
-            LinkedHashMap<String, byte[]> reservations = new LinkedHashMap<>();
-            classfiles.forEach((type, classfile) -> reservations.put(
+            LinkedHashMap<String, byte[]> reservedClassfiles = new LinkedHashMap<>();
+            LinkedHashMap<String, RuntimeData> reservedRuntimeData = new LinkedHashMap<>();
+            classfiles.forEach((type, classfile) -> reservedClassfiles.put(
                     binaryName(requireNonNull(type, "type is null")),
                     requireNonNull(classfile, "classfile is null").clone()));
-            for (String name : reservations.keySet()) {
+            runtimeData.forEach((type, value) -> reservedRuntimeData.put(
+                    binaryName(requireNonNull(type, "type is null")),
+                    RuntimeData.merge(configuredRuntimeData, requireNonNull(value, "runtimeData value is null"))));
+
+            for (String name : reservedClassfiles.keySet()) {
                 if (pending.containsKey(name) || findLoadedClass(name) != null) {
                     throw new IllegalArgumentException("Class is already defined or pending: " + name);
                 }
             }
-            RuntimeData effectiveRuntimeData = RuntimeData.merge(this.runtimeData, runtimeData);
-            this.runtimeData = effectiveRuntimeData;
-            pending.putAll(reservations);
-            return new Reservation(reservations);
+            for (Map.Entry<String, RuntimeData> entry : reservedRuntimeData.entrySet()) {
+                RuntimeData existing = this.runtimeData.get(entry.getKey());
+                if (existing != null && !RuntimeData.compatible(existing, entry.getValue())) {
+                    throw new IllegalArgumentException("Runtime data is already set for " + entry.getKey());
+                }
+            }
+
+            Reservation reservation = new Reservation();
+            reservedRuntimeData.forEach((name, value) -> {
+                if (this.runtimeData.putIfAbsent(name, value) == null) {
+                    reservation.runtimeDataNames.add(name);
+                }
+            });
+            reservedClassfiles.forEach((name, classfile) -> {
+                PendingClass pendingClass = new PendingClass(classfile, reservation);
+                reservation.classes.put(name, pendingClass);
+                pending.put(name, pendingClass);
+            });
+            return reservation;
         }
 
         private synchronized void releasePending(Reservation reservation)
         {
-            reservation.classfiles().forEach((name, classfile) -> {
-                pending.remove(name, classfile);
+            reservation.classes.forEach((name, pendingClass) -> {
+                if (pending.remove(name, pendingClass) && reservation.runtimeDataNames.contains(name)) {
+                    runtimeData.remove(name);
+                }
             });
         }
 
@@ -223,11 +323,25 @@ public final class StandardClassDefiner
         protected synchronized Class<?> findClass(String name)
                 throws ClassNotFoundException
         {
-            byte[] classfile = pending.remove(name);
-            if (classfile == null) {
+            PendingClass pendingClass = pending.get(name);
+            if (pendingClass == null) {
                 throw new ClassNotFoundException(name);
             }
-            return defineClass(name, classfile, 0, classfile.length);
+            if (pendingClass.defining) {
+                throw new ClassNotFoundException("Class is already being defined: " + name);
+            }
+            pendingClass.defining = true;
+            try {
+                byte[] classfile = pendingClass.classfile;
+                Class<?> definedClass = defineClass(name, classfile, 0, classfile.length);
+                pendingClass.defined = true;
+                pending.remove(name, pendingClass);
+                return definedClass;
+            }
+            catch (Throwable failure) {
+                pendingClass.defining = false;
+                throw failure;
+            }
         }
 
         @Override
@@ -263,20 +377,49 @@ public final class StandardClassDefiner
         @Override
         public synchronized RuntimeData runtimeData(Class<?> generatedClass)
         {
-            requireNonNull(generatedClass, "generatedClass is null");
-            return runtimeData;
+            return runtimeData.getOrDefault(requireNonNull(generatedClass, "generatedClass is null").getName(), configuredRuntimeData);
         }
 
-        private synchronized RuntimeData configuredRuntimeData()
+        private RuntimeData configuredRuntimeData()
         {
-            return runtimeData;
+            return configuredRuntimeData;
         }
 
-        private record Reservation(Map<String, byte[]> classfiles)
+        private synchronized void setRuntimeData(Reservation reservation, ClassDesc type, RuntimeData runtimeData)
         {
-            private Reservation
+            requireNonNull(reservation, "reservation is null");
+            String name = binaryName(requireNonNull(type, "type is null"));
+            PendingClass pendingClass = reservation.classes.get(name);
+            if (pendingClass == null || pendingClass.reservation != reservation || (pending.get(name) != pendingClass && !pendingClass.defined)) {
+                throw new IllegalStateException("Class is not pending for this reservation: " + name);
+            }
+            RuntimeData effective = RuntimeData.merge(configuredRuntimeData, requireNonNull(runtimeData, "runtimeData is null"));
+            RuntimeData existing = this.runtimeData.get(name);
+            if (existing != null && !RuntimeData.compatible(existing, effective)) {
+                throw new IllegalArgumentException("Runtime data is already set for " + name);
+            }
+            if (this.runtimeData.putIfAbsent(name, effective) == null) {
+                reservation.runtimeDataNames.add(name);
+            }
+        }
+
+        private static final class Reservation
+        {
+            private final Map<String, PendingClass> classes = new LinkedHashMap<>();
+            private final Set<String> runtimeDataNames = new LinkedHashSet<>();
+        }
+
+        private static final class PendingClass
+        {
+            private final byte[] classfile;
+            private final Reservation reservation;
+            private boolean defining;
+            private boolean defined;
+
+            private PendingClass(byte[] classfile, Reservation reservation)
             {
-                classfiles = Map.copyOf(requireNonNull(classfiles, "classfiles is null"));
+                this.classfile = requireNonNull(classfile, "classfile is null");
+                this.reservation = requireNonNull(reservation, "reservation is null");
             }
         }
     }
