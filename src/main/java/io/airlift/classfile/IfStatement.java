@@ -14,6 +14,7 @@
 package io.airlift.classfile;
 
 import static io.airlift.classfile.CodeBlock.block;
+import static io.airlift.classfile.Identity.same;
 import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.util.Objects.requireNonNull;
 
@@ -60,6 +61,14 @@ public final class IfStatement
     public String description()
     {
         return description;
+    }
+
+    IfStatement rewrite(BytecodeExpression condition, CodeBlock ifTrue, CodeBlock ifFalse)
+    {
+        if (same(this.condition, condition) && same(this.ifTrue, ifTrue) && same(this.ifFalse, ifFalse)) {
+            return this;
+        }
+        return new IfStatement(condition, ifTrue, ifFalse, description);
     }
 
     @Override

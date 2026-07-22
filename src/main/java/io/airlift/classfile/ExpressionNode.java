@@ -468,6 +468,32 @@ sealed interface ExpressionNode
         }
     }
 
+    record LinkedMethodInvocation(
+            ClassDesc type,
+            CompiledUnit.LinkedMethod method,
+            List<BytecodeExpression> arguments)
+            implements ExpressionNode
+    {
+        public LinkedMethodInvocation
+        {
+            requireNonNull(type, "type is null");
+            requireNonNull(method, "method is null");
+            arguments = List.copyOf(requireNonNull(arguments, "arguments is null"));
+        }
+
+        @Override
+        public String formatOneLine()
+        {
+            return arguments.stream().map(Object::toString).collect(joining(", ", method.name() + "(", ")"));
+        }
+
+        @Override
+        public List<BytecodeExpression> children()
+        {
+            return arguments;
+        }
+    }
+
     record InvokeDynamic(ClassDesc type, DynamicCallSiteDesc callSite, List<BytecodeExpression> arguments)
             implements ExpressionNode
     {

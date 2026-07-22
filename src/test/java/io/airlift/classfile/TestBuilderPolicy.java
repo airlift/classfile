@@ -307,6 +307,31 @@ class TestBuilderPolicy
                 "super class cannot be set after the default constructor is declared");
     }
 
+    @Test
+    void testCompilationPolicyBuilderPropertiesAreSetOnce()
+    {
+        CompilationPolicy.Builder builder = CompilationPolicy.builder()
+                .hardMethodCodeLimit(10_000)
+                .targetMethodCodeLimit(8_000)
+                .maxInlineSize(40)
+                .frequentInlineSize(400);
+
+        CompilationPolicy policy = builder.build();
+        assertThat(policy.hardMethodCodeLimit()).isEqualTo(10_000);
+        assertThat(policy.targetMethodCodeLimit()).isEqualTo(8_000);
+        assertThat(policy.maxInlineSize()).isEqualTo(40);
+        assertThat(policy.frequentInlineSize()).isEqualTo(400);
+        assertThat(policy.jitThresholdFallback()).isFalse();
+        assertAlreadySet(() -> builder.maxInlineSize(41), "max inline size is already set");
+        assertAlreadySet(() -> builder.frequentInlineSize(401), "frequent inline size is already set");
+    }
+
+    @Test
+    void testDefaultCompilationPolicyIsReused()
+    {
+        assertThat(CompilationPolicy.defaults()).isSameAs(CompilationPolicy.defaults());
+    }
+
     private static void assertAlreadySet(Runnable action, String message)
     {
         assertThatThrownBy(action::run)

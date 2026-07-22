@@ -64,58 +64,170 @@ import static java.lang.reflect.AccessFlag.INTERFACE;
 import static java.lang.reflect.AccessFlag.SUPER;
 import static java.util.Objects.requireNonNull;
 
+/// Validates and compiles logical class models for a specific runtime linkage environment.
+///
+/// A compiler is immutable. Configuration methods return a new compiler, and compilation never
+/// mutates the supplied logical model. [ClassCompiler#compileUnit(ClassModel)] additionally
+/// provides a physical compilation report and name-free linkage for supplied physical models;
+/// the simpler compiled forms retain their explicitly authored class boundaries.
 public final class ClassCompiler
 {
     private final CompilationTarget target;
     private final Optional<Object> classData;
+    private final CompilationPolicy policy;
+    private final boolean policySet;
 
-    private ClassCompiler(CompilationTarget target, Optional<Object> classData)
+    private ClassCompiler(CompilationTarget target, Optional<Object> classData, CompilationPolicy policy, boolean policySet)
     {
         this.target = requireNonNull(target, "target is null");
         this.classData = requireNonNull(classData, "classData is null");
+        this.policy = requireNonNull(policy, "policy is null");
+        this.policySet = policySet;
     }
 
+    /// Creates a compiler for the exact linkage environment in which its output will be defined.
     public static ClassCompiler forTarget(CompilationTarget target)
     {
-        return new ClassCompiler(target, Optional.empty());
+        return new ClassCompiler(target, Optional.empty(), CompilationPolicy.defaults(), false);
     }
 
+    /// Supplies the caller-owned class-data value made available by
+    /// [BytecodeExpressions#classData(Class)].
+    ///
+    /// The value is retained by the compiled artifact and may be set once.
     public ClassCompiler classData(Object classData)
     {
         if (this.classData.isPresent()) {
             throw new IllegalStateException("class data is already set");
         }
-        return new ClassCompiler(target, Optional.of(requireNonNull(classData, "classData is null")));
+        return new ClassCompiler(target, Optional.of(requireNonNull(classData, "classData is null")), policy, policySet);
     }
 
+    /// Replaces the physical-planning policy for this compiler. The policy may be set once.
+    public ClassCompiler policy(CompilationPolicy policy)
+    {
+        if (policySet) {
+            throw new IllegalStateException("compilation policy is already set");
+        }
+        return new ClassCompiler(target, classData, requireNonNull(policy, "policy is null"), true);
+    }
+
+    /// Compiles one logical model to one classfile.
+    ///
+    /// Large methods may be split into helper methods in the same class. Use
+    /// [ClassCompiler#compileUnit(ClassModel)] when a compilation report is desired.
     public CompiledClass compileClass(ClassModel definition)
     {
         requireNonNull(definition, "definition is null");
-        LinkageContext linkage = new LinkageContext(target, List.of(definition));
+        ClassModel physicalDefinition = plan(definition).model();
+        LinkageContext linkage = new LinkageContext(target, List.of(physicalDefinition));
         ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
         BindingCollector bindings = new BindingCollector();
-        EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+        EmittedClass emitted = emitClassfile(physicalDefinition, bindings, classFile, linkage, classData);
+        enforceHardMethodLimit(List.of(emitted.classInfo()));
         return new CompiledClass(
                 target,
-                definition.type(),
+                physicalDefinition.type(),
                 emitted.classfile(),
                 new RuntimeData(classData, bindings.values()),
                 emitted.classDataTypes(),
                 emitted.lambdaFactoryRequired());
     }
 
+    /// Compiles a primary logical model into a complete physical unit.
+    ///
+    /// The result may contain helper classes and name-free links introduced by automatic physical
+    /// planning. Callers normally define the result as a unit and then retrieve its primary class.
+    public CompiledUnit compileUnit(ClassModel definition)
+    {
+        return compileUnit(requireNonNull(definition, "definition is null"), List.of());
+    }
+
+    CompiledUnit compileUnit(ClassModel primary, List<ClassModel> auxiliaryClasses)
+    {
+        requireNonNull(primary, "primary is null");
+        auxiliaryClasses = List.copyOf(requireNonNull(auxiliaryClasses, "auxiliaryClasses is null"));
+        ArrayList<ClassModel> definitions = new ArrayList<>(auxiliaryClasses.size() + 1);
+        definitions.addAll(auxiliaryClasses);
+        definitions.add(primary);
+
+        List<PlannedDefinition> plannedDefinitions = definitions.stream()
+                .map(this::plan)
+                .toList();
+        definitions = new ArrayList<>(plannedDefinitions.stream()
+                .map(PlannedDefinition::model)
+                .toList());
+
+        LinkageContext linkage = new LinkageContext(target, definitions);
+        ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
+        ArrayList<CompiledUnit.Artifact> artifacts = new ArrayList<>(definitions.size());
+        LinkedHashMap<ClassDesc, Boolean> seen = new LinkedHashMap<>();
+        for (ClassModel definition : definitions) {
+            requireNonNull(definition, "definition is null");
+            if (seen.putIfAbsent(definition.type(), true) != null) {
+                throw new IllegalArgumentException("Class is defined more than once: " + definition.type().displayName());
+            }
+            BindingCollector bindings = new BindingCollector();
+            EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+            artifacts.add(new CompiledUnit.Artifact(
+                    definition.type(),
+                    emitted.classfile(),
+                    classData,
+                    bindings.bindings(),
+                    emitted.classDataTypes(),
+                    emitted.lambdaFactoryRequired(),
+                    emitted.classInfo()));
+        }
+        ArrayList<CompilationWarning> warnings = new ArrayList<>();
+        if (policy.jitThresholdFallback()) {
+            warnings.add(new CompilationWarning(
+                    CompilationWarning.Category.JIT_THRESHOLD_FALLBACK,
+                    primary.type().displayName(),
+                    "HugeMethodLimit is not observable on this JVM; using the 8,000-byte HotSpot fallback with a 10% safety margin"));
+        }
+        CompilationReport measured = enforceHardMethodLimit(artifacts, warnings);
+        measured.classes().forEach(classInfo -> classInfo.methods().stream()
+                .filter(method -> method.codeBytes() > policy.targetMethodCodeLimit())
+                .forEach(method -> warnings.add(new CompilationWarning(
+                        CompilationWarning.Category.HUGE_METHOD,
+                        classInfo.type().displayName() + "." + method.name() + method.type().descriptorString(),
+                        "Emitted method is %s bytes, above the %s-byte optimizing-compilation target"
+                                .formatted(method.codeBytes(), policy.targetMethodCodeLimit())))));
+        return new CompiledUnit(target, primary.type(), artifacts, new CompilationReport(policy, measured.classes(), warnings));
+    }
+
+    private PlannedDefinition plan(ClassModel definition)
+    {
+        ExpressionPlanner.Result expressions = ExpressionPlanner.plan(definition, policy, target.hiddenClass());
+        StatementPlanner.Result statements = StatementPlanner.plan(expressions.model(), policy, Set.copyOf(expressions.generatedMethods()), target.hiddenClass());
+        LinkedHashSet<String> generatedMethods = new LinkedHashSet<>(expressions.generatedMethods());
+        generatedMethods.addAll(statements.generatedMethods());
+        return new PlannedDefinition(statements.model(), Set.copyOf(generatedMethods));
+    }
+
+    private record PlannedDefinition(ClassModel model, Set<String> generatedMethods) {}
+
+    /// Compiles explicitly authored nominal classes with shared runtime bindings.
+    ///
+    /// Symbolic references between the classes remain ordinary named class references. Use
+    /// [ClassCompiler#compileUnit(ClassModel)] for physical-plan reporting and name-free links.
     public CompiledClassBundle compileClassBundle(List<ClassModel> definitions)
     {
         definitions = List.copyOf(requireNonNull(definitions, "definitions is null"));
         if (definitions.isEmpty()) {
             throw new IllegalArgumentException("definitions is empty");
         }
+        definitions = definitions.stream()
+                .map(this::plan)
+                .map(PlannedDefinition::model)
+                .toList();
         LinkageContext linkage = new LinkageContext(target, definitions);
         ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
 
         BindingCollector bindings = new BindingCollector();
         LinkedHashMap<ClassDesc, byte[]> classfiles = new LinkedHashMap<>();
         LinkedHashSet<ClassDesc> classDataTypes = new LinkedHashSet<>();
+        ArrayList<CompilationReport.ClassInfo> classInfos = new ArrayList<>(definitions.size());
         for (ClassModel definition : definitions) {
             requireNonNull(definition, "definition is null");
             if (classfiles.containsKey(definition.type())) {
@@ -124,8 +236,28 @@ public final class ClassCompiler
             EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
             classfiles.put(definition.type(), emitted.classfile());
             classDataTypes.addAll(emitted.classDataTypes());
+            classInfos.add(emitted.classInfo());
         }
+        enforceHardMethodLimit(classInfos);
         return new CompiledClassBundle(target, classfiles, new RuntimeData(classData, bindings.values()), classDataTypes);
+    }
+
+    private void enforceHardMethodLimit(List<CompilationReport.ClassInfo> classes)
+    {
+        classes.forEach(classInfo -> classInfo.methods().stream()
+                .filter(method -> method.codeBytes() > policy.hardMethodCodeLimit())
+                .findFirst()
+                .ifPresent(method -> {
+                    throw new CompilationException("Generated method %s.%s%s is %s bytes, above the configured hard limit of %s bytes"
+                            .formatted(classInfo.type().displayName(), method.name(), method.type().descriptorString(), method.codeBytes(), policy.hardMethodCodeLimit()));
+                }));
+    }
+
+    private CompilationReport enforceHardMethodLimit(List<CompiledUnit.Artifact> artifacts, List<CompilationWarning> warnings)
+    {
+        CompilationReport measured = CompilationReport.measure(policy, artifacts, warnings);
+        enforceHardMethodLimit(measured.classes());
+        return measured;
     }
 
     private static EmittedClass emitClassfile(ClassModel definition, BindingCollector bindings, ClassFile classFile, LinkageContext linkage, Optional<Object> classData)
@@ -134,11 +266,16 @@ public final class ClassCompiler
             linkage.requireGeneratedType(definition.type());
             Set<ClassDesc> classDataTypes = LinkageValidator.validate(definition, linkage, classData);
             byte[] classfile = classFile.build(definition.type(), classBuilder -> emitClass(definition, classBuilder, bindings, linkage));
-            List<VerifyError> errors = classFile.verify(classfile);
+            java.lang.classfile.ClassModel parsedClassfile = classFile.parse(classfile);
+            List<VerifyError> errors = classFile.verify(parsedClassfile);
             if (!errors.isEmpty()) {
                 throw new CompilationException("Verification failed for " + definition.type().displayName() + ":\n" + ClassFileDiagnostics.disassemble(classfile));
             }
-            return new EmittedClass(classfile, classDataTypes, bindings.lambdaFactoryRequired());
+            return new EmittedClass(
+                    classfile,
+                    classDataTypes,
+                    bindings.lambdaFactoryRequired(),
+                    CompilationReport.measure(definition.type(), classfile, parsedClassfile));
         }
         catch (CompilationException e) {
             throw e;
@@ -153,17 +290,19 @@ public final class ClassCompiler
         private final byte[] classfile;
         private final Set<ClassDesc> classDataTypes;
         private final boolean lambdaFactoryRequired;
+        private final CompilationReport.ClassInfo classInfo;
 
-        private EmittedClass(byte[] classfile, Set<ClassDesc> classDataTypes, boolean lambdaFactoryRequired)
+        private EmittedClass(byte[] classfile, Set<ClassDesc> classDataTypes, boolean lambdaFactoryRequired, CompilationReport.ClassInfo classInfo)
         {
-            this.classfile = requireNonNull(classfile, "classfile is null").clone();
+            this.classfile = requireNonNull(classfile, "classfile is null");
             this.classDataTypes = Set.copyOf(requireNonNull(classDataTypes, "classDataTypes is null"));
             this.lambdaFactoryRequired = lambdaFactoryRequired;
+            this.classInfo = requireNonNull(classInfo, "classInfo is null");
         }
 
         private byte[] classfile()
         {
-            return classfile.clone();
+            return classfile;
         }
 
         private Set<ClassDesc> classDataTypes()
@@ -175,13 +314,15 @@ public final class ClassCompiler
         {
             return lambdaFactoryRequired;
         }
+
+        private CompilationReport.ClassInfo classInfo()
+        {
+            return classInfo;
+        }
     }
 
     private static void emitClass(ClassModel definition, ClassBuilder builder, BindingCollector bindings, LinkageContext linkage)
     {
-        definition.methods().stream()
-                .filter(MethodDefinition.Model::hasBody)
-                .forEach(method -> ModelValidator.validateMethod(definition, method));
         builder.withFlags(classAccess(definition.access()))
                 .withSuperclass(definition.superClass())
                 .withInterfaceSymbols(definition.interfaces());
@@ -590,6 +731,7 @@ public final class ClassCompiler
                 context.code().ldc(constant);
             }
             case ExpressionNode.BoundMethodHandleInvocation invocation -> emitBoundMethodHandle(invocation, context);
+            case ExpressionNode.LinkedMethodInvocation invocation -> emitLinkedMethod(invocation, context);
             case ExpressionNode.InvokeDynamic invokeDynamic -> {
                 DynamicCallSiteDesc callSite = invokeDynamic.callSite();
                 if (context.linkage().hiddenClass()) {
@@ -629,6 +771,22 @@ public final class ClassCompiler
                 index);
         emitArguments(invocation.arguments(), DescriptorUtils.methodType(adapted.type()), context);
         context.code().invokedynamic(callSite);
+    }
+
+    private static void emitLinkedMethod(ExpressionNode.LinkedMethodInvocation invocation, EmitContext context)
+    {
+        int index = context.bindings().bind(invocation.method());
+        DynamicConstantDesc<?> constant = DynamicConstantDesc.ofNamed(
+                BootstrapDescriptors.bindingConstant(),
+                "binding",
+                ConstantDescs.CD_MethodHandle,
+                index);
+        context.code().ldc(constant);
+        emitArguments(invocation.arguments(), invocation.method().type(), context);
+        context.code().invokevirtual(
+                ConstantDescs.CD_MethodHandle,
+                "invokeExact",
+                invocation.method().type());
     }
 
     private static void emitConstant(ExpressionNode.Constant constant, EmitContext context)
@@ -1267,7 +1425,8 @@ public final class ClassCompiler
     {
         private final Map<Object, Integer> indexes = new IdentityHashMap<>();
         private final Map<MethodHandle, Map<MethodType, Integer>> adaptedHandleIndexes = new IdentityHashMap<>();
-        private final ArrayList<Object> values = new ArrayList<>();
+        private final Map<CompiledUnit.LinkedMethod, Integer> linkedMethodIndexes = new HashMap<>();
+        private final ArrayList<CompiledUnit.Binding> bindings = new ArrayList<>();
         private boolean lambdaFactoryRequired;
 
         private void requireLambdaFactory()
@@ -1283,8 +1442,16 @@ public final class ClassCompiler
         private int bind(Object value)
         {
             return indexes.computeIfAbsent(requireNonNull(value, "value is null"), _ -> {
-                values.add(value);
-                return values.size() - 1;
+                bindings.add(new CompiledUnit.ValueBinding(value));
+                return bindings.size() - 1;
+            });
+        }
+
+        private int bind(CompiledUnit.LinkedMethod method)
+        {
+            return linkedMethodIndexes.computeIfAbsent(requireNonNull(method, "method is null"), _ -> {
+                bindings.add(new CompiledUnit.MethodBinding(method));
+                return bindings.size() - 1;
             });
         }
 
@@ -1296,7 +1463,17 @@ public final class ClassCompiler
 
         private List<Object> values()
         {
-            return List.copyOf(values);
+            return bindings.stream()
+                    .map(binding -> switch (binding) {
+                        case CompiledUnit.ValueBinding value -> value.value();
+                        case CompiledUnit.MethodBinding method -> throw new IllegalStateException("Generated method link requires a compiled unit: " + method.method());
+                    })
+                    .toList();
+        }
+
+        private List<CompiledUnit.Binding> bindings()
+        {
+            return List.copyOf(bindings);
         }
     }
 
