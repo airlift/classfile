@@ -120,7 +120,14 @@ public final class HiddenClassDefiner
             unit.validateRuntimeData(type, effectiveRuntimeData);
             MethodHandles.Lookup defined;
             try {
-                if (effectiveRuntimeData.equals(RuntimeData.EMPTY)) {
+                if (unit.lambdaFactoryRequired(type)) {
+                    defined = hostLookup.defineHiddenClassWithClassData(
+                            unit.classfile(type),
+                            new HiddenClassRuntimeData(effectiveRuntimeData, lambdaFactory),
+                            initialize,
+                            options);
+                }
+                else if (effectiveRuntimeData.isEmpty()) {
                     defined = hostLookup.defineHiddenClass(unit.classfile(type), initialize, options);
                 }
                 else {

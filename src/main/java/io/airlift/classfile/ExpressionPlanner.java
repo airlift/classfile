@@ -663,7 +663,7 @@ final class ExpressionPlanner
         };
     }
 
-    private static ExpressionNode rewriteChildren(ExpressionNode node, Function<BytecodeExpression, BytecodeExpression> rewrite)
+    static ExpressionNode rewriteChildren(ExpressionNode node, Function<BytecodeExpression, BytecodeExpression> rewrite)
     {
         return switch (node) {
             case ExpressionNode.Constant value -> value;

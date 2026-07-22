@@ -196,6 +196,31 @@ class TestSyntheticExpressions
     }
 
     @Test
+    void testSequentialSyntheticSetupSplits()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("SequentialSetup")).access(PUBLIC, FINAL);
+        MethodDefinition method = definition.method("value", int.class).access(PUBLIC, STATIC);
+        Variable result = method.body().declare("result", new SequentialSetup(256));
+        method.body().ret(result);
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .hardMethodCodeLimit(1_000)
+                .targetMethodCodeLimit(100)
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().getFirst().methods())
+                .extracting(CompilationReport.MethodInfo::name)
+                .anyMatch(name -> name.startsWith("value$blocks$"));
+
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("value").invoke(null)).isEqualTo(256);
+    }
+
+    @Test
     void testBoundHandleDenseSyntheticSetupsUseCompactCallSites()
             throws Exception
     {
@@ -295,6 +320,27 @@ class TestSyntheticExpressions
         public String toString()
         {
             return "addThenDouble(" + input + ")";
+        }
+    }
+
+    private record SequentialSetup(int statements)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable state = setup.declare("state", constantInt(0));
+            for (int index = 0; index < statements; index++) {
+                setup.append(CodeBlock.block(state.set(state.add(constantInt(1)))));
+            }
+            return new ExpressionPlan(setup.build(), state);
         }
     }
 
