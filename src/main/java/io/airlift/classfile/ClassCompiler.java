@@ -45,6 +45,7 @@ import java.lang.invoke.MethodType;
 import java.lang.reflect.AccessFlag;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -54,6 +55,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import static java.lang.classfile.TypeKind.DOUBLE;
 import static java.lang.classfile.TypeKind.FLOAT;
@@ -72,6 +74,8 @@ import static java.util.Objects.requireNonNull;
 /// explicitly authored class boundaries.
 public final class ClassCompiler
 {
+    private static final boolean[] NO_ALIAS_COPY_DECLARATIONS = {};
+
     private final CompilationTarget target;
     private final Optional<Object> classData;
     private final CompilationPolicy policy;
@@ -427,8 +431,19 @@ public final class ClassCompiler
         }
         context.enterBlock(block);
         try {
-            for (Statement statement : block.statements()) {
-                emitStatement(statement, context);
+            boolean[] aliasCopyDeclarations = aliasCopyDeclarations(block.statements());
+            for (int index = 0; index < block.statements().size(); index++) {
+                Statement statement = block.statements().get(index);
+                if (statement instanceof Statements.InitializedDeclaration declaration &&
+                        declaration.initializer() instanceof LocalValue source &&
+                        aliasCopyDeclarations.length != 0 &&
+                        aliasCopyDeclarations[index]) {
+                    context.alias(declaration.variable(), source);
+                    context.declare(declaration.variable());
+                }
+                else {
+                    emitStatement(statement, context);
+                }
             }
         }
         finally {
@@ -437,6 +452,36 @@ public final class ClassCompiler
                 context.exitScope();
             }
         }
+    }
+
+    private static boolean[] aliasCopyDeclarations(List<Statement> statements)
+    {
+        boolean hasCandidate = false;
+        for (Statement statement : statements) {
+            if (statement instanceof Statements.InitializedDeclaration declaration && declaration.initializer() instanceof LocalValue) {
+                hasCandidate = true;
+                break;
+            }
+        }
+        if (!hasCandidate) {
+            return NO_ALIAS_COPY_DECLARATIONS;
+        }
+        boolean[] aliases = new boolean[statements.size()];
+        Set<Variable> writtenLater = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (int index = statements.size() - 1; index >= 0; index--) {
+            Statement statement = statements.get(index);
+            if (statement instanceof Statements.InitializedDeclaration declaration &&
+                    declaration.initializer() instanceof LocalValue source) {
+                aliases[index] = declaration.variable().type().equals(source.type()) &&
+                        !writtenLater.contains(declaration.variable()) &&
+                        (!(source instanceof Variable sourceVariable) || !writtenLater.contains(sourceVariable));
+            }
+            visitVariableWrites(statement, variable -> {
+                writtenLater.add(variable);
+                return false;
+            });
+        }
+        return aliases;
     }
 
     private static void emitStatement(Statement statement, EmitContext context)
@@ -448,8 +493,7 @@ public final class ClassCompiler
             case Statements.Expression expression -> emitExpressionStatement(expression.expression(), context);
             case Statements.InitializedDeclaration declaration -> {
                 context.declare(declaration.variable());
-                emitExpressionAs(declaration.initializer(), declaration.variable().type(), context);
-                context.store(declaration.variable());
+                emitExpressionInto(declaration.initializer(), declaration.variable(), context);
             }
             case Statements.Comment _ -> {}
             case Statements.LabelBinding binding -> context.code().labelBinding(context.labelTarget(binding.label()).label());
@@ -686,8 +730,13 @@ public final class ClassCompiler
                 ExpressionPlan plan = synthetic.expansion(ExpansionContext.INSTANCE);
                 context.enterScope();
                 try {
-                    emitBlock(plan.setup(), context, false);
-                    emitExpression(plan.value(), context);
+                    if (canEmitSyntheticValue(plan)) {
+                        emitValueBlock(plan.setup(), (Variable) plan.value(), context, false);
+                    }
+                    else {
+                        emitBlock(plan.setup(), context, false);
+                        emitExpression(plan.value(), context);
+                    }
                 }
                 finally {
                     context.exitScope();
@@ -753,8 +802,7 @@ public final class ClassCompiler
                 context.code().invokedynamic(callSite);
             }
             case ExpressionNode.SetVariable setVariable -> {
-                emitExpressionAs(setVariable.value(), setVariable.variable().type(), context);
-                context.store(setVariable.variable());
+                emitExpressionInto(setVariable.value(), setVariable.variable(), context);
             }
             case ExpressionNode.Increment increment -> context.increment(increment.variable());
             case ExpressionNode.Adapter adapter -> emitAdapter(adapter, context);
@@ -779,6 +827,172 @@ public final class ClassCompiler
                 index);
         emitArguments(invocation.arguments(), DescriptorUtils.methodType(adapted.type()), context);
         context.code().invokedynamic(callSite);
+    }
+
+    private static void emitExpressionInto(BytecodeExpression expression, Variable target, EmitContext context)
+    {
+        emitExpressionAs(expression, target.type(), context);
+        context.store(target);
+    }
+
+    private static boolean canEmitSyntheticValue(ExpressionPlan plan)
+    {
+        if (!(plan.value() instanceof Variable result) ||
+                !result.owner().equals(plan.setup().scope()) ||
+                plan.setup().statements().stream().noneMatch(statement -> statement instanceof Statements.Declaration declaration && declaration.variable() == result)) {
+            return false;
+        }
+        return terminallyAssigns(plan.setup(), result);
+    }
+
+    private static void emitValueBlock(CodeBlock block, Variable result, EmitContext context, boolean nested)
+    {
+        if (nested) {
+            context.enterScope();
+        }
+        context.enterBlock(block);
+        try {
+            for (int index = 0; index < block.statements().size() - 1; index++) {
+                Statement statement = block.statements().get(index);
+                if (!(statement instanceof Statements.Declaration declaration && declaration.variable() == result)) {
+                    emitStatement(statement, context);
+                }
+            }
+            emitTerminalValue(block.statements().getLast(), result, context);
+        }
+        finally {
+            context.exitBlock();
+            if (nested) {
+                context.exitScope();
+            }
+        }
+    }
+
+    private static void emitTerminalValue(Statement statement, Variable result, EmitContext context)
+    {
+        switch (statement) {
+            case BytecodeExpression expression -> emitTerminalValue(expression, result, context);
+            case Statements.Expression expression -> emitTerminalValue(expression.expression(), result, context);
+            case CodeBlock block -> emitValueBlock(block, result, context, true);
+            case IfStatement ifStatement -> {
+                Label falseLabel = context.code().newLabel();
+                Label end = context.code().newLabel();
+                emitBranch(ifStatement.condition(), false, falseLabel, context);
+                emitValueBlock(ifStatement.ifTrue(), result, context, true);
+                context.code().goto_(end).labelBinding(falseLabel);
+                emitValueBlock(ifStatement.ifFalse(), result, context, true);
+                context.code().labelBinding(end);
+            }
+            default -> throw new IllegalArgumentException("Statement does not terminally assign " + result.name() + ": " + statement);
+        }
+    }
+
+    private static void emitTerminalValue(BytecodeExpression expression, Variable result, EmitContext context)
+    {
+        ExpressionNode.SetVariable setVariable = (ExpressionNode.SetVariable) ((CoreExpression) expression).node();
+        if (setVariable.variable() != result) {
+            throw new IllegalArgumentException("Expression does not assign " + result.name() + ": " + expression);
+        }
+        emitExpressionAs(setVariable.value(), result.type(), context);
+    }
+
+    private static boolean terminallyAssigns(CodeBlock block, Variable variable)
+    {
+        if (block.statements().isEmpty()) {
+            return false;
+        }
+        List<Statement> prefix = block.statements().subList(0, block.statements().size() - 1);
+        if (prefix.stream().anyMatch(statement -> writesVariable(statement, variable))) {
+            return false;
+        }
+        return terminallyAssigns(block.statements().getLast(), variable);
+    }
+
+    private static boolean terminallyAssigns(Statement statement, Variable variable)
+    {
+        return switch (statement) {
+            case BytecodeExpression expression -> terminallyAssigns(expression, variable);
+            case Statements.Expression expression -> terminallyAssigns(expression.expression(), variable);
+            case CodeBlock block -> terminallyAssigns(block, variable);
+            case IfStatement ifStatement -> ExpressionPlanner.locals(ifStatement.condition()).stream().noneMatch(local -> local == variable) &&
+                    !writesVariable(ifStatement.condition(), variable) &&
+                    terminallyAssigns(ifStatement.ifTrue(), variable) &&
+                    terminallyAssigns(ifStatement.ifFalse(), variable);
+            default -> false;
+        };
+    }
+
+    private static boolean terminallyAssigns(BytecodeExpression expression, Variable variable)
+    {
+        if (!(expression instanceof CoreExpression core) ||
+                !(core.node() instanceof ExpressionNode.SetVariable setVariable) ||
+                setVariable.variable() != variable) {
+            return false;
+        }
+        return ExpressionPlanner.locals(setVariable.value()).stream().noneMatch(local -> local == variable) &&
+                !writesVariable(setVariable.value(), variable);
+    }
+
+    private static boolean writesVariable(Statement statement, Variable variable)
+    {
+        return visitVariableWrites(statement, written -> written == variable);
+    }
+
+    private static boolean writesVariable(BytecodeExpression expression, Variable variable)
+    {
+        return visitVariableWrites(expression, written -> written == variable);
+    }
+
+    private static boolean visitVariableWrites(Statement statement, Predicate<Variable> visitor)
+    {
+        return switch (statement) {
+            case BytecodeExpression expression -> visitVariableWrites(expression, visitor);
+            case Statements.Expression expression -> visitVariableWrites(expression.expression(), visitor);
+            case Statements.InitializedDeclaration declaration -> visitVariableWrites(declaration.initializer(), visitor);
+            case CodeBlock block -> visitVariableWrites(block, visitor);
+            case IfStatement ifStatement -> visitVariableWrites(ifStatement.condition(), visitor) ||
+                    visitVariableWrites(ifStatement.ifTrue(), visitor) ||
+                    visitVariableWrites(ifStatement.ifFalse(), visitor);
+            case ForLoop loop -> visitVariableWrites(loop.initializer(), visitor) ||
+                    visitVariableWrites(loop.condition(), visitor) ||
+                    visitVariableWrites(loop.update(), visitor) ||
+                    visitVariableWrites(loop.body(), visitor);
+            case WhileLoop loop -> visitVariableWrites(loop.condition(), visitor) || visitVariableWrites(loop.body(), visitor);
+            case DoWhileLoop loop -> visitVariableWrites(loop.body(), visitor) || visitVariableWrites(loop.condition(), visitor);
+            case SwitchStatement switchStatement -> visitVariableWrites(switchStatement.expression(), visitor) ||
+                    switchStatement.cases().stream().anyMatch(caseValue -> visitVariableWrites(caseValue.body(), visitor)) ||
+                    visitVariableWrites(switchStatement.defaultCase(), visitor);
+            case TryCatch tryCatch -> visitVariableWrites(tryCatch.tryBlock(), visitor) ||
+                    tryCatch.catches().stream().anyMatch(catchClause -> visitVariableWrites(catchClause.body(), visitor)) ||
+                    tryCatch.finallyBlock().map(block -> visitVariableWrites(block, visitor)).orElse(false);
+            case Statements.ConstructorInvocation invocation -> invocation.arguments().stream().anyMatch(argument -> visitVariableWrites(argument, visitor));
+            case Statements.Declaration _,
+                 Statements.Comment _,
+                 Statements.Jump _,
+                 Statements.LabelBinding _,
+                 LoopJump _ -> false;
+        };
+    }
+
+    private static boolean visitVariableWrites(CodeBlock block, Predicate<Variable> visitor)
+    {
+        return block.statements().stream().anyMatch(statement -> visitVariableWrites(statement, visitor));
+    }
+
+    private static boolean visitVariableWrites(BytecodeExpression expression, Predicate<Variable> visitor)
+    {
+        return switch (expression) {
+            case LocalValue _ -> false;
+            case SyntheticExpression synthetic -> {
+                ExpressionPlan plan = synthetic.expansion(ExpansionContext.INSTANCE);
+                yield visitVariableWrites(plan.setup(), visitor) || visitVariableWrites(plan.value(), visitor);
+            }
+            case CoreExpression core -> switch (core.node()) {
+                case ExpressionNode.SetVariable setVariable -> visitor.test(setVariable.variable()) || visitVariableWrites(setVariable.value(), visitor);
+                case ExpressionNode.Increment increment -> visitor.test(increment.variable());
+                default -> core.node().children().stream().anyMatch(child -> visitVariableWrites(child, visitor));
+            };
+        };
     }
 
     private static void emitLinkedMethod(ExpressionNode.LinkedMethodInvocation invocation, EmitContext context)
@@ -1493,6 +1707,8 @@ public final class ClassCompiler
         private final BindingCollector bindingCollector;
         private final LinkageContext linkage;
         private final Map<LocalValue, LocalBinding> bindings = new IdentityHashMap<>();
+        private final Set<LocalValue> predeclaredAliases = Collections.newSetFromMap(new IdentityHashMap<>());
+        private final Set<LocalValue> nonOwningBindings = Collections.newSetFromMap(new IdentityHashMap<>());
         private final ArrayDeque<List<LocalValue>> scopes = new ArrayDeque<>();
         private final Map<Object, LoopLabels> loops = new IdentityHashMap<>();
         private final ArrayDeque<Map<CodeLabel, LabelTarget>> labelScopes = new ArrayDeque<>();
@@ -1575,17 +1791,38 @@ public final class ClassCompiler
         {
             for (LocalValue variable : scopes.pop()) {
                 LocalBinding binding = bindings.remove(variable);
-                release(binding);
+                predeclaredAliases.remove(variable);
+                if (!nonOwningBindings.remove(variable)) {
+                    release(binding);
+                }
             }
         }
 
         private void declare(Variable variable)
         {
+            if (predeclaredAliases.remove(variable)) {
+                return;
+            }
             if (bindings.containsKey(variable)) {
                 throw new CompilationException("Variable is already bound: " + variable.name());
             }
             TypeKind kind = kind(variable.type());
             bind(variable, new LocalBinding(kind, allocate(kind)));
+        }
+
+        private void alias(Variable alias, LocalValue target)
+        {
+            if (bindings.containsKey(alias)) {
+                throw new CompilationException("Variable is already bound: " + alias.name());
+            }
+            LocalBinding targetBinding = resolve(target);
+            if (kind(alias.type()) != targetBinding.kind()) {
+                throw new CompilationException("Alias type does not match target: " + alias.name());
+            }
+            bindings.put(alias, targetBinding);
+            scopes.getFirst().add(alias);
+            predeclaredAliases.add(alias);
+            nonOwningBindings.add(alias);
         }
 
         private void bind(LocalValue variable, LocalBinding binding)

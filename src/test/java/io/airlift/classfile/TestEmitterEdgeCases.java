@@ -80,6 +80,33 @@ class TestEmitterEdgeCases
         assertThat(define(classDefinition.build()).getMethod("length").invoke(null)).isEqualTo(5);
     }
 
+    @Test
+    void testLocalCopiesRemainIndependentWhenEitherVariableIsWrittenLater()
+            throws Exception
+    {
+        ClassDefinition classDefinition = generatedClass("LocalCopies");
+
+        Parameter copyInput = Parameter.arg("input", int.class);
+        MethodDefinition copyBeforeSourceWrite = classDefinition.method("copyBeforeSourceWrite", CD_int, copyInput).access(PUBLIC, STATIC);
+        Variable source = copyBeforeSourceWrite.body().declare("source", copyInput);
+        Variable copy = copyBeforeSourceWrite.body().declare("copy", source);
+        copyBeforeSourceWrite.body()
+                .append(source.set(constantInt(99)))
+                .ret(copy);
+
+        Parameter sourceInput = Parameter.arg("input", int.class);
+        MethodDefinition sourceBeforeCopyWrite = classDefinition.method("sourceBeforeCopyWrite", CD_int, sourceInput).access(PUBLIC, STATIC);
+        source = sourceBeforeCopyWrite.body().declare("source", sourceInput);
+        copy = sourceBeforeCopyWrite.body().declare("copy", source);
+        sourceBeforeCopyWrite.body()
+                .append(copy.set(constantInt(99)))
+                .ret(source);
+
+        Class<?> generated = define(classDefinition.build());
+        assertThat(generated.getMethod("copyBeforeSourceWrite", int.class).invoke(null, 42)).isEqualTo(42);
+        assertThat(generated.getMethod("sourceBeforeCopyWrite", int.class).invoke(null, 42)).isEqualTo(42);
+    }
+
     private ClassDefinition generatedClass(String suffix)
     {
         ClassDesc type = ClassDesc.of(getClass().getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
