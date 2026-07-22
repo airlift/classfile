@@ -1,8 +1,9 @@
 # Automatic Code Splitting
 
 Automatic code splitting converts a logical `ClassModel` into a loadable
-`CompiledUnit` whose methods fit JVM limits. Authors write the natural expression
-and statement structure. They do not choose chunk sizes or declare split helpers.
+`CompiledUnit` whose methods and constant pools fit JVM limits. Authors write the
+natural expression and statement structure. They do not choose chunk sizes, declare
+split helpers, or name companion classes.
 
 Splitting is part of `ClassCompiler.compileUnit(...)`:
 
@@ -17,8 +18,8 @@ DefinedUnit defined = HiddenClassDefiner.builder(MethodHandles.lookup())
 Class<?> generatedClass = defined.primaryClass();
 ```
 
-The compiler may add private helper methods. These physical artifacts are
-implementation details. The logical model is not modified,
+The compiler may add private helper methods and synthetic companion classes. These
+physical artifacts are implementation details. The logical model is not modified,
 and the generated code preserves Java evaluation order, exceptions, side effects,
 short-circuiting, and lexical variable values.
 
@@ -59,13 +60,19 @@ hash = hash$statements$3(values, hash);
 return hash;
 ```
 
+If the generated helpers put too much pressure on one class, they are moved into
+synthetic companion classes. Calls to those companions are linked with method handles
+rather than symbolic generated-class references.
+
 ## Compilation Pipeline
 
-`compileUnit(...)` performs three physical-planning steps in a fixed order:
+`compileUnit(...)` performs four physical-planning steps in a fixed order:
 
 1. Split large expressions into static helper methods.
 2. Split eligible top-level statement sequences into static helper methods.
-3. Emit every physical class, measure the exact classfiles, enforce the configured
+3. Move generated helpers into companion classes when helper count or constant usage
+   puts pressure on the primary class.
+4. Emit every physical class, measure the exact classfiles, enforce the configured
    hard method limit, and produce a `CompilationReport`.
 
 The first two steps use conservative size estimates to choose candidates. The final
@@ -99,10 +106,10 @@ The physical result is a `CompiledUnit`. It contains:
 - dependency-safe class definition order;
 - exact measurements and warnings in a `CompilationReport`.
 
-Use `compileUnit(...)` when physical-plan inspection or hidden-class definition is
-required. The narrower `compileClass(...)` and `compileClassBundle(...)` entry points
-perform expression and statement planning but do not produce a `CompiledUnit` or a
-compilation report.
+Use `compileUnit(...)` when automatic class sharding, physical-plan inspection, or
+hidden-class definition is required. The narrower `compileClass(...)` and
+`compileClassBundle(...)` entry points perform expression and statement planning but
+do not produce a `CompiledUnit`, class sharding, or a compilation report.
 
 ## Compilation Policy
 
@@ -370,6 +377,81 @@ code across exception handlers. A large method dominated by one indivisible cont
 structure may remain above the target and produce a warning, or may fail if it exceeds
 the hard limit.
 
+## Companion Classes
+
+Generated helpers normally remain in the primary physical class. `ClassSharder` moves
+them into synthetic companion classes when either of these planning thresholds is
+exceeded:
+
+- more than 96 generated helpers in one class;
+- more than 20,000 estimated constant references across generated helpers.
+
+Movable helpers are grouped into companions containing at most 96 helpers and at most
+20,000 estimated constant references. Companion types use a readable source-derived
+name such as `GeneratedStrategy$Generated1`.
+
+These thresholds are conservative planning values, not JVM limits and not public
+binary compatibility promises.
+
+### Movability
+
+A helper can move only when it is independent of caller identity and of private state
+owned by the logical class. The sharder pins a generated helper that contains:
+
+- a field access owned by the logical class;
+- construction of the logical class;
+- a dynamic constant or manually authored `invokedynamic` call site;
+- an invocation of an ordinary method owned by the logical class;
+- `invokespecial`;
+- a JDK caller-sensitive operation, including operations owned by `MethodHandles` or
+  `StackWalker`;
+- a constructor invocation;
+- a try/catch region;
+- a label, jump, `break`, or `continue`.
+
+Movability is checked recursively through nested statements and synthetic-expression
+expansions.
+
+For hidden-class compilation, a helper is also pinned when its descriptor, local
+types, expression metadata, or constant descriptors refer symbolically to the logical
+hidden class. Hidden classes cannot be resolved by their authored binary name from a
+separately defined companion. Helpers with authored generic signatures, exceptions,
+or annotations are conservatively pinned because those metadata structures can carry
+the same kind of symbolic reference.
+
+Dynamic linkage is pinned because the JVM supplies the physical instruction owner as
+the bootstrap `Lookup`. Compiler-managed bound constants, bound method handles, and
+generated linked-method calls remain movable: they are not manually bootstrapped
+`invokedynamic` instructions, and their runtime data is attached to the physical class
+that receives them. `classData()` is currently represented as a dynamic constant and
+is therefore conservatively pinned as well.
+
+Class sharding currently requires the complete generated-helper family to be movable.
+If one helper is pinned, the family remains in the primary class. This avoids creating
+a primary-to-companion-to-primary linkage cycle without a more complex mutable
+linkage protocol.
+
+### Name-Free Linkage
+
+A call between generated physical classes is not emitted as a symbolic classfile
+reference. Instead, the caller contains a runtime binding slot for a typed
+`MethodHandle`.
+
+`CompiledUnit` records each `LinkedMethod` dependency and computes a definition order
+in which dependencies precede callers. A definer then:
+
+1. defines a dependency;
+2. resolves its generated method handles;
+3. places those handles in the caller's runtime data;
+4. defines the caller;
+5. exposes the logical primary class through `DefinedUnit`.
+
+This works for both nominal and hidden classes. Hidden companions do not need stable,
+name-resolvable identities. The same physical linkage model is used by
+`StandardClassDefiner` and `HiddenClassDefiner`.
+
+A generated linkage cycle is rejected while constructing the `CompiledUnit`.
+
 ## Helper Names And Stack Traces
 
 Generated method names are derived from the logical method:
@@ -470,6 +552,12 @@ An `if/else` may move only as part of an eligible normally completing scoped blo
 Large expressions inside pinned structures can still split, but the structure itself
 remains in the logical method.
 
+### Class Sharding Constraints
+
+A generated-helper family containing a caller-sensitive or owner-sensitive helper is
+not sharded. If that class then exceeds a classfile structural limit, classfile
+emission fails rather than changing visibility or inventing cyclic runtime linkage.
+
 ### Exact Size Is Known After Emission
 
 Candidate selection uses estimates. Exact bytecode size depends on constant-pool
@@ -501,13 +589,16 @@ The main executable splitting examples are:
 - `TestCompiledUnit.testLargeBooleanExpressionPreservesShortCircuiting`;
 - `TestCompiledUnit.testConstructorPreSuperCalculationUsesStaticExpressionHelpers`;
 - `TestCompiledUnit.testOptimizationWarningDoesNotPreventDefinition`;
+- `TestCompiledUnit.testConstantPoolPressureCreatesCompanionClasses`;
 - `TestAutomaticFlatHashSplitting.testTwoThousandFieldsThroughNominalAndHiddenClasses`;
 - `TestAutomaticFlatHashSplitting.testTenThousandFieldHashStress`;
 - `TestAutomaticRowConstructorSplitting.testBulkyFieldsAreSplitWithoutManualHelpers`.
 
 The FlatHash fixture builds the logical operations without manual chunks. It executes
-a 2,001-field strategy through both nominal and hidden definersand stress-tests a 10,000-field hash method while checking the physical classfiles
-against JVM hard limits.
+a 2,001-field strategy through both nominal and hidden definers, stress-tests a
+10,000-field hash method, and checks the physical classfiles against JVM hard limits.
+A separate 25,000-distinct-string fixture exercises constant-pool-driven companion
+creation.
 
 The row-constructor fixture models independently scoped, conditionally initialized
 fields without authored chunks. It verifies extraction of block-owned locals and
@@ -531,6 +622,12 @@ introduced only with workload evidence and explicit performance testing.
 A helper could return a structured result describing normal completion, return,
 break, or continue. That would permit extraction across more control-flow boundaries,
 but it would make generated Java semantics and stack traces harder to understand.
+
+### Partial And Cyclic Class Sharding
+
+A dependency-aware sharder could move only a proven one-way subset of helpers. More
+aggressive designs could use mutable call sites or staged linkage for cycles. The
+current all-or-nothing movability rule deliberately avoids that runtime complexity.
 
 ### Iterative Exact-Size Replanning
 
