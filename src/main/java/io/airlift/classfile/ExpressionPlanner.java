@@ -56,7 +56,7 @@ final class ExpressionPlanner
             changed |= different(rewritten, method);
         }
         if (!changed && planner.helpers.isEmpty()) {
-            return new Result(definition, List.of());
+            return new Result(definition, List.of(), Set.copyOf(planner.lambdaImplementations));
         }
         ArrayList<MethodDefinition.Model> physicalMethods = new ArrayList<>(methods.size() + planner.helpers.size());
         physicalMethods.addAll(methods);
@@ -74,10 +74,10 @@ final class ExpressionPlanner
                 definition.sourceFile(),
                 definition.visibleAnnotations(),
                 definition.invisibleAnnotations());
-        return new Result(physical, List.copyOf(planner.names));
+        return new Result(physical, List.copyOf(planner.names), Set.copyOf(planner.lambdaImplementations));
     }
 
-    record Result(ClassModel model, List<String> generatedMethods) {}
+    record Result(ClassModel model, List<String> generatedMethods, Set<HiddenClassLinkage.MethodReference> lambdaImplementations) {}
 
     private static final class Planner
     {
@@ -86,6 +86,7 @@ final class ExpressionPlanner
         private final boolean hiddenClass;
         private final ArrayList<MethodDefinition.Model> helpers = new ArrayList<>();
         private final ArrayList<String> names = new ArrayList<>();
+        private final Set<HiddenClassLinkage.MethodReference> lambdaImplementations = new LinkedHashSet<>();
         private final Set<String> usedMethodNames;
         private String logicalMethod;
         private Optional<Variable> logicalReceiver = Optional.empty();
@@ -232,6 +233,9 @@ final class ExpressionPlanner
 
                 CoreExpression core = (CoreExpression) frame.expression;
                 ExpressionNode node = core.node();
+                if (hiddenClass && node instanceof ExpressionNode.InvokeDynamic invokeDynamic) {
+                    HiddenClassLinkage.implementationMethod(invokeDynamic.callSite(), owner).ifPresent(lambdaImplementations::add);
+                }
                 List<BytecodeExpression> children = node.children();
                 if (frame.rewrittenChildren.size() < children.size()) {
                     BytecodeExpression child = children.get(frame.rewrittenChildren.size());

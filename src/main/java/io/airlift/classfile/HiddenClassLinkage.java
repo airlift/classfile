@@ -31,6 +31,7 @@ import static java.lang.constant.ConstantDescs.CD_MethodType;
 import static java.lang.constant.ConstantDescs.CD_Object;
 import static java.lang.constant.ConstantDescs.CD_String;
 import static java.lang.constant.DirectMethodHandleDesc.Kind.STATIC;
+import static java.util.Objects.requireNonNull;
 
 /// Rewrites caller-sensitive linkage shapes that cannot name the VM identity of a hidden class.
 ///
@@ -78,6 +79,16 @@ final class HiddenClassLinkage
                 implementation.lookupDescriptor(),
                 samMethodType.descriptorString(),
                 instantiatedMethodType.descriptorString());
+    }
+
+    static Optional<MethodReference> implementationMethod(DynamicCallSiteDesc callSite, ClassDesc currentOwner)
+    {
+        return lambdaSite(callSite, currentOwner)
+                .map(LambdaSite::implementation)
+                .filter(implementation -> implementation.kind() != DirectMethodHandleDesc.Kind.CONSTRUCTOR)
+                .map(implementation -> new MethodReference(
+                        implementation.methodName(),
+                        MethodTypeDesc.ofDescriptor(implementation.lookupDescriptor())));
     }
 
     private static Optional<LambdaSite> lambdaSite(DynamicCallSiteDesc callSite, ClassDesc currentOwner)
@@ -141,6 +152,18 @@ final class HiddenClassLinkage
             componentType = componentType.componentType();
         }
         return componentType.equals(currentOwner) ? CD_Object : type;
+    }
+
+    record MethodReference(String name, MethodTypeDesc type)
+    {
+        MethodReference
+        {
+            requireNonNull(name, "name is null");
+            requireNonNull(type, "type is null");
+            if (name.isEmpty()) {
+                throw new IllegalArgumentException("name is empty");
+            }
+        }
     }
 
     private record LambdaSite(MethodTypeDesc samMethodType, DirectMethodHandleDesc implementation, MethodTypeDesc instantiatedMethodType) {}
