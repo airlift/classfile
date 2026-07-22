@@ -14,6 +14,7 @@
 package io.airlift.classfile;
 
 import static io.airlift.classfile.CodeBlock.block;
+import static io.airlift.classfile.Identity.same;
 import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.util.Objects.requireNonNull;
 
@@ -63,6 +64,14 @@ public final class DoWhileLoop
     public String description()
     {
         return description;
+    }
+
+    DoWhileLoop rewrite(BytecodeExpression condition, CodeBlock body)
+    {
+        if (same(this.condition, condition) && same(this.body, body)) {
+            return this;
+        }
+        return new DoWhileLoop(target, condition, body, description);
     }
 
     @Override

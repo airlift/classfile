@@ -17,7 +17,6 @@ import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.MethodTypeDesc;
 import java.lang.reflect.AccessFlag;
-import java.lang.reflect.AccessFlag.Location;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -140,7 +139,7 @@ final class ModelValidator
     private static void validateKind(ClassModel definition)
     {
         definition.access().stream()
-                .filter(flag -> !flag.locations().contains(Location.CLASS))
+                .filter(flag -> !flag.locations().contains(AccessFlag.Location.CLASS))
                 .findFirst()
                 .ifPresent(flag -> {
                     throw new IllegalArgumentException("Access flag is not valid for a class: " + flag);
@@ -178,7 +177,7 @@ final class ModelValidator
         }
     }
 
-    private static void validateAccessLocation(Set<AccessFlag> access, Location location, String target)
+    private static void validateAccessLocation(Set<AccessFlag> access, AccessFlag.Location location, String target)
     {
         access.stream()
                 .filter(flag -> !flag.locations().contains(location))
@@ -934,6 +933,7 @@ final class ModelValidator
                  ExpressionNode.Binary _,
                  ExpressionNode.BoundConstant _,
                  ExpressionNode.BoundMethodHandleInvocation _,
+                 ExpressionNode.LinkedMethodInvocation _,
                  ExpressionNode.Cast _,
                  ExpressionNode.DynamicConstant _,
                  ExpressionNode.FieldGet _,

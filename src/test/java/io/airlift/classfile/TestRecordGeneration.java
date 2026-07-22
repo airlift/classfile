@@ -57,14 +57,15 @@ class TestRecordGeneration
     {
         RecordModel record = pointRecord();
         StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
-        CompiledClass compiled = ClassCompiler.forTarget(definer.compilationTarget()).compileClass(record.model());
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(record.model());
+        DefinedUnit defined = definer.defineUnit(unit);
 
-        Class<?> recordClass = definer.defineCompiledClass(compiled);
+        Class<?> recordClass = defined.primaryClass();
         assertRecord(record, recordClass);
         assertThat(recordClass.isHidden()).isFalse();
-        assertThat(ClassFile.of().parse(compiled.classfile()).findAttribute(Attributes.record()))
+        assertThat(ClassFile.of().parse(unit.classfile(unit.primaryType())).findAttribute(Attributes.record()))
                 .isPresent();
-        assertThat(ClassFileDiagnostics.disassemble(compiled.classfile()))
+        assertThat(ClassFileDiagnostics.disassemble(unit.classfile(unit.primaryType())))
                 .contains("record component int x", "record component String name");
         assertThat(record.model().toString())
                 .startsWith("public record " + record.model().type().displayName() + "(int x, String name) {")
@@ -78,11 +79,13 @@ class TestRecordGeneration
     {
         RecordModel record = pointRecord();
         HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
-        CompiledClass compiled = ClassCompiler.forTarget(definer.compilationTarget()).compileClass(record.model());
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(record.model());
+        DefinedUnit defined = definer.defineUnit(unit);
 
-        Class<?> recordClass = definer.defineCompiledClass(compiled).lookupClass();
+        Class<?> recordClass = defined.primaryClass();
         assertRecord(record, recordClass);
         assertThat(recordClass.isHidden()).isTrue();
+        assertThat(defined.primaryLookup()).isPresent();
     }
 
     @Test
@@ -161,14 +164,14 @@ class TestRecordGeneration
                 .build();
 
         StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
-        CompiledClass compiled = ClassCompiler.forTarget(definer.compilationTarget()).compileClass(definition.build());
-        Class<?> recordClass = definer.defineCompiledClass(compiled);
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(definition.build());
+        Class<?> recordClass = definer.defineUnit(unit).primaryClass();
         RecordComponent reflected = recordClass.getRecordComponents()[0];
         assertThat(reflected.getName()).isEqualTo("items");
         assertThat(reflected.getGenericType().getTypeName()).isEqualTo("java.util.List<java.lang.String>");
         assertThat(reflected.getAnnotation(ComponentMarker.class).value()).isEqualTo("items");
 
-        RecordAttribute attribute = ClassFile.of().parse(compiled.classfile())
+        RecordAttribute attribute = ClassFile.of().parse(unit.classfile(unit.primaryType()))
                 .findAttribute(Attributes.record())
                 .orElseThrow();
         assertThat(attribute.components()).hasSize(1);
@@ -241,7 +244,7 @@ class TestRecordGeneration
         ClassDefinition abstractRecord = ClassDefinition.defineRecord(generatedType("Abstract")).access(PUBLIC, ABSTRACT);
         assertThatThrownBy(abstractRecord::build)
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Record cannot be abstract");
+                .hasMessage("Record cannot be abstract: " + abstractRecord.type().displayName());
 
         ClassDefinition privateAccessor = ClassDefinition.defineRecord(generatedType("Accessor")).access(PUBLIC);
         privateAccessor.recordComponent("value", int.class).build();

@@ -33,6 +33,12 @@ import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.IntUnaryOperator;
@@ -661,6 +667,87 @@ class TestRuntimeDefiners
     }
 
     @Test
+    void testRuntimeDataConflictsUseValueIdentity()
+            throws Throwable
+    {
+        String compiledData = new String("equal-data");
+        String configuredData = new String("equal-data");
+        assertThat(compiledData).isEqualTo(configuredData).isNotSameAs(configuredData);
+
+        ClassDefinition definition = ClassDefinition.define(generatedClass("RuntimeDataIdentity")).access(PUBLIC, FINAL);
+        definition.method("value", String.class).access(PUBLIC, STATIC).body().ret(classData(String.class));
+        ClassModel model = definition.build();
+
+        StandardClassDefiner standard = StandardClassDefiner.builder(getClass().getClassLoader())
+                .runtimeData(RuntimeData.ofClassData(configuredData))
+                .build();
+        ClassCompiler standardCompiler = ClassCompiler.forTarget(standard.compilationTarget()).classData(compiledData);
+        assertThatThrownBy(() -> standard.defineCompiledClass(standardCompiler.compileClass(model)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Runtime data is incompatible");
+        assertThatThrownBy(() -> standard.defineUnit(standardCompiler.compileUnit(model)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Runtime data is incompatible");
+        assertDefinerStillUsable(standard);
+
+        HiddenClassDefiner hidden = HiddenClassDefiner.builder(MethodHandles.lookup())
+                .runtimeData(RuntimeData.ofClassData(configuredData))
+                .build();
+        ClassCompiler hiddenCompiler = ClassCompiler.forTarget(hidden.compilationTarget()).classData(compiledData);
+        assertThatThrownBy(() -> hidden.defineCompiledClass(hiddenCompiler.compileClass(model)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Runtime data is incompatible");
+        assertThatThrownBy(() -> hidden.defineUnit(hiddenCompiler.compileUnit(model)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Runtime data is incompatible");
+        assertDefinerStillUsable(hidden);
+
+        StandardClassDefiner matchingStandard = StandardClassDefiner.builder(getClass().getClassLoader())
+                .runtimeData(RuntimeData.ofClassData(compiledData))
+                .build();
+        Class<?> standardClass = matchingStandard.defineCompiledClass(
+                ClassCompiler.forTarget(matchingStandard.compilationTarget()).classData(compiledData).compileClass(model));
+        assertThat(standardClass.getMethod("value").invoke(null)).isSameAs(compiledData);
+
+        HiddenClassDefiner matchingHidden = HiddenClassDefiner.builder(MethodHandles.lookup())
+                .runtimeData(RuntimeData.ofClassData(compiledData))
+                .build();
+        MethodHandles.Lookup hiddenClass = matchingHidden.defineCompiledClass(
+                ClassCompiler.forTarget(matchingHidden.compilationTarget()).classData(compiledData).compileClass(model));
+        assertThat(hiddenClass.findStatic(hiddenClass.lookupClass(), "value", MethodType.methodType(String.class)).invoke())
+                .isSameAs(compiledData);
+
+        String compiledBinding = new String("equal-binding");
+        String configuredBinding = new String("equal-binding");
+        assertThatThrownBy(() -> RuntimeData.merge(
+                new RuntimeData(Optional.empty(), List.of(configuredBinding)),
+                new RuntimeData(Optional.empty(), List.of(compiledBinding))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Runtime data is incompatible");
+        assertThat(RuntimeData.merge(
+                new RuntimeData(Optional.empty(), List.of(compiledBinding)),
+                new RuntimeData(Optional.empty(), List.of(compiledBinding))).binding(0))
+                .isSameAs(compiledBinding);
+    }
+
+    private static void assertDefinerStillUsable(StandardClassDefiner definer)
+            throws ReflectiveOperationException
+    {
+        ClassDefinition unrelated = ClassDefinition.define(generatedClass("AfterRuntimeDataConflict")).access(PUBLIC, FINAL);
+        unrelated.method("value", int.class).access(PUBLIC, STATIC).body().ret(constantInt(7));
+        assertThat(definer.defineClass(unrelated.build()).getMethod("value").invoke(null)).isEqualTo(7);
+    }
+
+    private static void assertDefinerStillUsable(HiddenClassDefiner definer)
+            throws Throwable
+    {
+        ClassDefinition unrelated = ClassDefinition.define(generatedClass("AfterRuntimeDataConflict")).access(PUBLIC, FINAL);
+        unrelated.method("value", int.class).access(PUBLIC, STATIC).body().ret(constantInt(7));
+        MethodHandles.Lookup defined = definer.defineClass(unrelated.build());
+        assertThat(defined.findStatic(defined.lookupClass(), "value", MethodType.methodType(int.class)).invoke()).isEqualTo(7);
+    }
+
+    @Test
     void testClassDataRejectsMismatchedTypeDuringCompilation()
     {
         ClassDefinition definition = ClassDefinition.define(generatedClass("MismatchedClassData")).access(PUBLIC, FINAL);
@@ -673,6 +760,94 @@ class TestRuntimeDefiners
                 .isInstanceOf(CompilationException.class)
                 .hasMessageContaining("class data")
                 .hasMessageContaining("java.lang.Integer");
+    }
+
+    @Test
+    void testPrecompiledClassDataIsValidatedBeforeDefinition()
+            throws Throwable
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("PrecompiledClassData")).access(PUBLIC, FINAL);
+        definition.method("value", Integer.class).access(PUBLIC, STATIC).body().ret(classData(Integer.class));
+        ClassModel model = definition.build();
+
+        StandardClassDefiner standard = StandardClassDefiner.builder(getClass().getClassLoader())
+                .runtimeData(RuntimeData.ofClassData("wrong"))
+                .build();
+        CompiledClass standardClass = ClassCompiler.forTarget(standard.compilationTarget()).compileClass(model);
+        assertThatThrownBy(() -> standard.defineCompiledClass(standardClass))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("runtime class data")
+                .hasMessageContaining("java.lang.Integer");
+
+        StandardClassDefiner standardUnit = StandardClassDefiner.builder(getClass().getClassLoader())
+                .runtimeData(RuntimeData.ofClassData("wrong"))
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(standardUnit.compilationTarget()).compileUnit(model);
+        assertThatThrownBy(() -> standardUnit.defineUnit(unit))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("runtime class data")
+                .hasMessageContaining("java.lang.Integer");
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        HiddenClassDefiner hidden = HiddenClassDefiner.builder(lookup)
+                .runtimeData(RuntimeData.ofClassData("wrong"))
+                .build();
+        CompiledClass hiddenClass = ClassCompiler.forTarget(hidden.compilationTarget()).compileClass(model);
+        assertThatThrownBy(() -> hidden.defineCompiledClass(hiddenClass))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("runtime class data")
+                .hasMessageContaining("java.lang.Integer");
+
+        HiddenClassDefiner hiddenUnit = HiddenClassDefiner.builder(lookup)
+                .runtimeData(RuntimeData.ofClassData("wrong"))
+                .build();
+        CompiledUnit hiddenCompiledUnit = ClassCompiler.forTarget(hiddenUnit.compilationTarget()).compileUnit(model);
+        assertThatThrownBy(() -> hiddenUnit.defineUnit(hiddenCompiledUnit))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("runtime class data")
+                .hasMessageContaining("java.lang.Integer");
+
+        StandardClassDefiner missing = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledClass missingClass = ClassCompiler.forTarget(missing.compilationTarget()).compileClass(model);
+        assertThatThrownBy(() -> missing.defineCompiledClass(missingClass))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("Class data is required");
+
+        Integer expected = 37;
+        StandardClassDefiner valid = StandardClassDefiner.builder(getClass().getClassLoader())
+                .runtimeData(RuntimeData.ofClassData(expected))
+                .build();
+        Class<?> generated = valid.defineCompiledClass(ClassCompiler.forTarget(valid.compilationTarget()).compileClass(model));
+        assertThat(generated.getMethod("value").invoke(null)).isSameAs(expected);
+    }
+
+    @Test
+    void testRuntimeBindingsRejectGeneratedDeclaredTypes()
+    {
+        ClassDefinition self = ClassDefinition.define(generatedClass("SelfTypedBinding")).access(PUBLIC, FINAL);
+        self.method("value", self.type()).access(PUBLIC, STATIC).body().ret(boundConstant(new Object(), self.type()));
+        StandardClassDefiner selfDefiner = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        assertThatThrownBy(() -> ClassCompiler.forTarget(selfDefiner.compilationTarget()).compileClass(self.build()))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("cannot be an instance of generated type");
+
+        ClassDefinition classDataDefinition = ClassDefinition.define(generatedClass("SelfTypedClassData")).access(PUBLIC, FINAL);
+        classDataDefinition.method("value", classDataDefinition.type()).access(PUBLIC, STATIC).body().ret(classData(classDataDefinition.type()));
+        StandardClassDefiner classDataDefiner = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        assertThatThrownBy(() -> ClassCompiler.forTarget(classDataDefiner.compilationTarget())
+                .classData(new Object())
+                .compileClass(classDataDefinition.build()))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("cannot be an instance of generated type");
+
+        ClassDefinition sibling = ClassDefinition.define(generatedClass("SiblingBindingTarget")).access(PUBLIC, FINAL);
+        ClassDefinition caller = ClassDefinition.define(generatedClass("SiblingBindingCaller")).access(PUBLIC, FINAL);
+        caller.method("value", sibling.type()).access(PUBLIC, STATIC).body().ret(boundConstant(new Object(), sibling.type()));
+        StandardClassDefiner bundleDefiner = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        assertThatThrownBy(() -> ClassCompiler.forTarget(bundleDefiner.compilationTarget())
+                .compileClassBundle(List.of(caller.build(), sibling.build())))
+                .isInstanceOf(CompilationException.class)
+                .hasMessageContaining("cannot be an instance of generated type");
     }
 
     @Test
@@ -778,6 +953,7 @@ class TestRuntimeDefiners
         ClassCompiler compiler = ClassCompiler.forTarget(compilationDefiner.compilationTarget());
         CompiledClass compiledClass = compiler.compileClass(definition);
         CompiledClassBundle compiledBundle = compiler.compileClassBundle(List.of(definition));
+        CompiledUnit compiledUnit = compiler.compileUnit(definition);
 
         StandardClassDefiner otherDefiner = StandardClassDefiner.builder(getClass().getClassLoader()).build();
         assertThatThrownBy(() -> otherDefiner.defineCompiledClass(compiledClass))
@@ -785,6 +961,10 @@ class TestRuntimeDefiners
                 .hasMessageContaining("compiled for")
                 .hasMessageContaining("cannot be defined by");
         assertThatThrownBy(() -> otherDefiner.defineCompiledClasses(compiledBundle))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("compiled for")
+                .hasMessageContaining("cannot be defined by");
+        assertThatThrownBy(() -> otherDefiner.defineUnit(compiledUnit))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("compiled for")
                 .hasMessageContaining("cannot be defined by");
@@ -835,6 +1015,60 @@ class TestRuntimeDefiners
         replacementDefinition.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("replacement", String.class));
         Class<?> replacement = definer.defineCompiledClass(compiler.compileClass(replacementDefinition.build()));
         assertThat(replacement.getMethod("value").invoke(null)).isEqualTo("replacement");
+    }
+
+    @Test
+    void testDefinitionFailureReleasesClassAndRuntimeDataReservations()
+            throws Exception
+    {
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassCompiler compiler = ClassCompiler.forTarget(definer.compilationTarget());
+
+        ClassDesc directType = generatedClass("RetryAfterDefinitionFailure");
+        ClassDefinition invalidDirect = ClassDefinition.define(directType).superClass(String.class).access(PUBLIC);
+        invalidDirect.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("stale", String.class));
+        assertThatThrownBy(() -> definer.defineCompiledClass(compiler.compileClass(invalidDirect.build())))
+                .isInstanceOf(IncompatibleClassChangeError.class);
+
+        ClassDefinition replacementDirect = ClassDefinition.define(directType).access(PUBLIC, FINAL);
+        replacementDirect.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("replacement", String.class));
+        Class<?> directClass = definer.defineCompiledClass(compiler.compileClass(replacementDirect.build()));
+        assertThat(directClass.getMethod("value").invoke(null)).isEqualTo("replacement");
+
+        ClassDesc unitType = generatedClass("RetryUnitAfterDefinitionFailure");
+        ClassDefinition invalidUnit = ClassDefinition.define(unitType).superClass(String.class).access(PUBLIC);
+        invalidUnit.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("stale-unit", String.class));
+        assertThatThrownBy(() -> definer.defineUnit(compiler.compileUnit(invalidUnit.build())))
+                .isInstanceOf(IncompatibleClassChangeError.class);
+
+        ClassDefinition replacementUnit = ClassDefinition.define(unitType).access(PUBLIC, FINAL);
+        replacementUnit.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("replacement-unit", String.class));
+        Class<?> unitClass = definer.defineUnit(compiler.compileUnit(replacementUnit.build())).primaryClass();
+        assertThat(unitClass.getMethod("value").invoke(null)).isEqualTo("replacement-unit");
+
+        ClassDefinition committedDefinition = ClassDefinition.define(generatedClass("CommittedBeforeDefinitionFailure")).access(PUBLIC, FINAL);
+        committedDefinition.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("committed", String.class));
+        ClassModel committed = committedDefinition.build();
+        ClassDesc failedBundleType = generatedClass("RetryBundleAfterDefinitionFailure");
+        ClassDefinition invalidBundle = ClassDefinition.define(failedBundleType).superClass(String.class).access(PUBLIC);
+        invalidBundle.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("stale-bundle", String.class));
+        ClassDesc untouchedBundleType = generatedClass("UntouchedAfterDefinitionFailure");
+        ClassDefinition untouchedBundle = ClassDefinition.define(untouchedBundleType).access(PUBLIC, FINAL);
+        untouchedBundle.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("stale-untouched", String.class));
+        assertThatThrownBy(() -> definer.defineCompiledClasses(compiler.compileClassBundle(List.of(committed, invalidBundle.build(), untouchedBundle.build()))))
+                .isInstanceOf(IncompatibleClassChangeError.class);
+
+        assertThatThrownBy(() -> definer.defineCompiledClass(compiler.compileClass(committed)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("already defined or pending");
+        ClassDefinition replacementBundle = ClassDefinition.define(failedBundleType).access(PUBLIC, FINAL);
+        replacementBundle.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("replacement-bundle", String.class));
+        Class<?> bundleClass = definer.defineCompiledClass(compiler.compileClass(replacementBundle.build()));
+        assertThat(bundleClass.getMethod("value").invoke(null)).isEqualTo("replacement-bundle");
+        ClassDefinition replacementUntouched = ClassDefinition.define(untouchedBundleType).access(PUBLIC, FINAL);
+        replacementUntouched.method("value", String.class).access(PUBLIC, STATIC).body().ret(boundConstant("replacement-untouched", String.class));
+        Class<?> untouchedClass = definer.defineCompiledClass(compiler.compileClass(replacementUntouched.build()));
+        assertThat(untouchedClass.getMethod("value").invoke(null)).isEqualTo("replacement-untouched");
     }
 
     @Test
@@ -898,6 +1132,84 @@ class TestRuntimeDefiners
         assertThatThrownBy(() -> CompilationTarget.forLookup(lookup))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("full privilege access");
+    }
+
+    @Test
+    void testStandardDefinerCanBeReusedConcurrently()
+            throws InterruptedException, ExecutionException, ReflectiveOperationException
+    {
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        List<Future<Class<?>>> definitions = new ArrayList<>();
+        try (ExecutorService executor = Executors.newFixedThreadPool(8)) {
+            for (int index = 0; index < 100; index++) {
+                ClassDefinition definition = ClassDefinition.define(generatedClass("Concurrent" + index)).access(PUBLIC, FINAL);
+                definition.method("value", Integer.class)
+                        .access(PUBLIC, STATIC)
+                        .body()
+                        .ret(boundConstant(index, Integer.class));
+                ClassModel model = definition.build();
+                definitions.add(executor.submit(() -> definer.defineClass(model)));
+            }
+        }
+
+        for (int index = 0; index < definitions.size(); index++) {
+            assertThat(definitions.get(index).get().getMethod("value").invoke(null)).isEqualTo(index);
+        }
+    }
+
+    @Test
+    void testCompiledArtifactsCanBeDefinedConcurrently()
+            throws InterruptedException, ExecutionException
+    {
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassCompiler compiler = ClassCompiler.forTarget(definer.compilationTarget());
+        List<Future<Object>> definitions = new ArrayList<>();
+        try (ExecutorService executor = Executors.newFixedThreadPool(8)) {
+            for (int index = 0; index < 60; index++) {
+                int expected = index;
+                ClassDefinition definition = ClassDefinition.define(generatedClass("ConcurrentArtifact" + index)).access(PUBLIC, FINAL);
+                definition.method("value", Integer.class)
+                        .access(PUBLIC, STATIC)
+                        .body()
+                        .ret(boundConstant(expected, Integer.class));
+                ClassModel model = definition.build();
+
+                switch (index % 3) {
+                    case 0 -> {
+                        CompiledClass compiledClass = compiler.compileClass(model);
+                        definitions.add(executor.submit(() -> definer.defineCompiledClass(compiledClass)
+                                .getMethod("value")
+                                .invoke(null)));
+                    }
+                    case 1 -> {
+                        ClassDefinition companionDefinition = ClassDefinition.define(generatedClass("ConcurrentBundleCompanion" + index)).access(PUBLIC, FINAL);
+                        companionDefinition.method("value", Integer.class)
+                                .access(PUBLIC, STATIC)
+                                .body()
+                                .ret(boundConstant(-expected, Integer.class));
+                        ClassModel companion = companionDefinition.build();
+                        CompiledClassBundle compiledBundle = compiler.compileClassBundle(List.of(model, companion));
+                        definitions.add(executor.submit(() -> {
+                            DefinedClasses classes = definer.defineCompiledClasses(compiledBundle);
+                            assertThat(classes.definedClass(companion).getMethod("value").invoke(null)).isEqualTo(-expected);
+                            return classes.definedClass(model).getMethod("value").invoke(null);
+                        }));
+                    }
+                    case 2 -> {
+                        CompiledUnit compiledUnit = compiler.compileUnit(model);
+                        definitions.add(executor.submit(() -> definer.defineUnit(compiledUnit)
+                                .primaryClass()
+                                .getMethod("value")
+                                .invoke(null)));
+                    }
+                    default -> throw new AssertionError();
+                }
+            }
+        }
+
+        for (int index = 0; index < definitions.size(); index++) {
+            assertThat(definitions.get(index).get()).isEqualTo(index);
+        }
     }
 
     @Test
@@ -991,6 +1303,39 @@ class TestRuntimeDefiners
     }
 
     @Test
+    void testBoundMethodHandleWithInaccessibleTypeIsNotExpressionExtracted()
+            throws Throwable
+    {
+        MethodHandle first = MethodHandles.lookup().findStatic(
+                TestRuntimeDefiners.class,
+                "firstHiddenValue",
+                MethodType.methodType(HiddenValue.class, HiddenValue.class, HiddenValue.class));
+        BytecodeExpression left = constantNull(Object.class);
+        BytecodeExpression right = constantNull(Object.class);
+        for (int index = 0; index < 225; index++) {
+            left = left.cast(Object.class);
+            right = right.cast(Object.class);
+        }
+        ClassDefinition definition = ClassDefinition.define(generatedClass("SplitBoundHandle")).access(PUBLIC, FINAL);
+        definition.method("value", Object.class).access(PUBLIC, STATIC).body()
+                .ret(boundMethodHandle(first).invoke(left, right));
+        definition.method("control", boolean.class).access(PUBLIC, STATIC).body()
+                .ret(invokeStatic(Objects.class, "equals", boolean.class, left, right));
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(definition.build());
+        List<String> methods = unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .map(CompilationReport.MethodInfo::name)
+                .toList();
+        assertThat(methods).anyMatch(name -> name.startsWith("control$expression$"));
+        assertThat(methods).noneMatch(name -> name.startsWith("value$expression$"));
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("value").invoke(null)).isNull();
+        assertThat(generated.getMethod("control").invoke(null)).isEqualTo(true);
+    }
+
+    @Test
     void testOrdinaryInaccessibleTypeFailsWithModelPath()
     {
         ClassDefinition classDefinition = ClassDefinition.define(generatedClass("InaccessibleType")).access(PUBLIC, FINAL);
@@ -1055,6 +1400,12 @@ class TestRuntimeDefiners
     private static HiddenValue hiddenIdentity(HiddenValue value)
     {
         return value;
+    }
+
+    @SuppressWarnings("UnusedMethod") // Referenced by a method handle in generated code.
+    private static HiddenValue firstHiddenValue(HiddenValue first, HiddenValue second)
+    {
+        return first != null ? first : second;
     }
 
     private record HiddenValue(int value) {}

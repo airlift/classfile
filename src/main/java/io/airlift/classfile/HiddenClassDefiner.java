@@ -13,10 +13,20 @@
  */
 package io.airlift.classfile;
 
+import java.lang.constant.ClassDesc;
+import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static java.util.Objects.requireNonNull;
 
+/// Defines generated hidden classes associated with a host [MethodHandles.Lookup].
+///
+/// Hidden classes are not discoverable by binary name. Compile for this definer's
+/// [HiddenClassDefiner#compilationTarget()] and retain the returned lookup or [DefinedUnit] to
+/// access the generated classes.
 public final class HiddenClassDefiner
 {
     private final MethodHandles.Lookup hostLookup;
@@ -39,19 +49,21 @@ public final class HiddenClassDefiner
         return new Builder(hostLookup);
     }
 
-    /// Returns the target describing the host lookup used by this definer.
+    /// Returns the target describing the host lookup used by this definer. Compile a [CompiledUnit]
+    /// for this target before passing it to [HiddenClassDefiner#defineUnit(CompiledUnit)].
     public CompilationTarget compilationTarget()
     {
         return CompilationTarget.forLookup(hostLookup, options);
     }
 
+    /// Compiles and defines one model as a hidden class using this definer's target.
     public MethodHandles.Lookup defineClass(ClassModel definition)
     {
         requireNonNull(definition, "definition is null");
         if (!runtimeData.bindings().isEmpty()) {
             throw new IllegalStateException("Preconfigured bindings cannot be used when compiling a class definition");
         }
-        ClassCompiler compiler = ClassCompiler.forTarget(CompilationTarget.forLookup(hostLookup));
+        ClassCompiler compiler = ClassCompiler.forTarget(compilationTarget());
         if (runtimeData.classData().isPresent()) {
             compiler = compiler.classData(runtimeData.classData().orElseThrow());
         }
@@ -59,6 +71,8 @@ public final class HiddenClassDefiner
         return defineCompiledClass(compiledClass);
     }
 
+    /// Defines an already compiled hidden class. The artifact must have been compiled for this
+    /// definer's target.
     public MethodHandles.Lookup defineCompiledClass(CompiledClass compiledClass)
     {
         requireNonNull(compiledClass, "compiledClass is null");
@@ -83,6 +97,56 @@ public final class HiddenClassDefiner
         }
     }
 
+    /// Defines every physical class in dependency order and returns the primary class and hidden
+    /// lookups. The unit must have been compiled for this definer's target.
+    public DefinedUnit defineUnit(CompiledUnit unit)
+    {
+        requireNonNull(unit, "unit is null");
+        unit.target().requireCompatibleWith(compilationTarget());
+        unit.validateConfiguredRuntimeData(runtimeData);
+        Map<CompiledUnit.LinkedMethod, MethodHandle> linkedMethods = new LinkedHashMap<>();
+        Map<ClassDesc, Class<?>> classes = new LinkedHashMap<>();
+        Map<ClassDesc, MethodHandles.Lookup> lookups = new LinkedHashMap<>();
+
+        for (ClassDesc type : unit.definitionOrder()) {
+            RuntimeData compiledRuntimeData = unit.runtimeData(type, method -> {
+                MethodHandle handle = linkedMethods.get(method);
+                if (handle == null) {
+                    throw new IllegalStateException("Generated method was not linked before its caller: " + method);
+                }
+                return handle;
+            });
+            RuntimeData effectiveRuntimeData = RuntimeData.merge(runtimeData, compiledRuntimeData);
+            unit.validateRuntimeData(type, effectiveRuntimeData);
+            MethodHandles.Lookup defined;
+            try {
+                if (effectiveRuntimeData.equals(RuntimeData.EMPTY)) {
+                    defined = hostLookup.defineHiddenClass(unit.classfile(type), initialize, options);
+                }
+                else {
+                    defined = hostLookup.defineHiddenClassWithClassData(unit.classfile(type), effectiveRuntimeData, initialize, options);
+                }
+            }
+            catch (IllegalAccessException e) {
+                throw new IllegalStateException("Unable to define hidden class " + type.displayName(), e);
+            }
+
+            classes.put(type, defined.lookupClass());
+            lookups.put(type, defined);
+            for (CompiledUnit.LinkedMethod method : unit.linkedMethodsOwnedBy(type)) {
+                try {
+                    MethodType methodType = MethodType.fromMethodDescriptorString(method.type().descriptorString(), defined.lookupClass().getClassLoader());
+                    linkedMethods.put(method, defined.findStatic(defined.lookupClass(), method.name(), methodType));
+                }
+                catch (NoSuchMethodException | IllegalAccessException e) {
+                    throw new IllegalStateException("Unable to link generated method " + method, e);
+                }
+            }
+        }
+        return new DefinedUnit(unit.primaryType(), classes, lookups);
+    }
+
+    /// Set-once configuration for hidden-class definition.
     public static final class Builder
     {
         private final MethodHandles.Lookup hostLookup;

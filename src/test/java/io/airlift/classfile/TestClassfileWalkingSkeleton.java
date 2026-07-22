@@ -77,7 +77,9 @@ class TestClassfileWalkingSkeleton
                 .ret());
 
         ClassModel classModel = classDefinition.build();
-        Class<?> generated = StandardClassDefiner.builder(getClass().getClassLoader()).build().defineClass(classModel);
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(classModel);
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
 
         Object instance = generated.getConstructor(String.class).newInstance("count");
         assertThat(generated.getMethod("add", int.class).invoke(instance, 7)).isEqualTo(7);

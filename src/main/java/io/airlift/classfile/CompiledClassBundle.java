@@ -21,10 +21,12 @@ import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
 
-/// A bundle of explicitly authored classfiles that share one runtime-data namespace.
+/// A nominal bundle of explicitly authored classfiles that share one runtime-data namespace.
 ///
-/// Define the bundle through the supplied runtime definer; the raw bytes may depend on private
-/// runtime bindings owned by the compiler.
+/// This form preserves symbolic links between the supplied class names and does not perform the
+/// name-free physical linkage supplied by [CompiledUnit]. Classfile bytes are defensively copied.
+/// Define the bundle through [StandardClassDefiner]; the raw bytes may depend on private runtime
+/// bindings owned by the compiler.
 public final class CompiledClassBundle
 {
     private final CompilationTarget target;
@@ -55,6 +57,7 @@ public final class CompiledClassBundle
         return classfiles.keySet();
     }
 
+    /// Returns a defensive copy of the classfile bytes for the symbolic type.
     public byte[] classfile(ClassDesc type)
     {
         byte[] classfile = classfiles.get(requireNonNull(type, "type is null"));
@@ -64,6 +67,7 @@ public final class CompiledClassBundle
         return classfile.clone();
     }
 
+    /// Returns an immutable map containing defensive copies of every classfile.
     public Map<ClassDesc, byte[]> classfiles()
     {
         LinkedHashMap<ClassDesc, byte[]> copies = new LinkedHashMap<>();

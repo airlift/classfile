@@ -25,6 +25,7 @@ import static io.airlift.classfile.BytecodeExpressions.constantLong;
 import static io.airlift.classfile.BytecodeExpressions.newArray;
 import static io.airlift.classfile.ClassfileTestUtils.defineHidden;
 import static java.lang.constant.ConstantDescs.CD_Object;
+import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PUBLIC;
@@ -93,6 +94,96 @@ class TestSyntheticExpressions
         assertThat((Object[]) generated.getMethod("values").invoke(null)).containsExactly(classTyped, descriptorTyped);
     }
 
+    @Test
+    void testSetupIsPreservedWhenReusableBlockIsMoved()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("MovedSetup")).access(PUBLIC, FINAL);
+        Parameter input = Parameter.arg("input", int.class);
+        MethodDefinition method = definition.method("value", int.class, input).access(PUBLIC, STATIC);
+        Variable result = method.body().declare("result", newArray(int[].class, constantInt(1)));
+        CodeBlock reusable = CodeBlock.blockBuilder()
+                .append(result.setElement(0, new AddThenDouble(input)))
+                .build();
+        for (int index = 0; index < 80; index++) {
+            method.body().append(reusable);
+        }
+        method.body().ret(result.getElement(0));
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .hardMethodCodeLimit(4_000)
+                .targetMethodCodeLimit(64)
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().getFirst().methods())
+                .extracting(CompilationReport.MethodInfo::name)
+                .anyMatch(name -> name.startsWith("value$blocks$"));
+
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("value", int.class).invoke(null, 5)).isEqualTo(12);
+    }
+
+    @Test
+    void testSetupExpressionRemainsInPlaceDuringValueSplitting()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("ConstrainedSetup")).access(PUBLIC, FINAL);
+        Parameter input = Parameter.arg("input", int.class);
+        MethodDefinition method = definition.method("value", int.class, input).access(PUBLIC, STATIC);
+        method.body().ret(new AddThenDouble(input).add(constantInt(1)));
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .hardMethodCodeLimit(4_000)
+                .targetMethodCodeLimit(64)
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("value", int.class).invoke(null, 5)).isEqualTo(13);
+    }
+
+    @Test
+    void testSetupExpressionsRemainInPlaceDuringStatementSplitting()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("StatementSetup")).access(PUBLIC, FINAL);
+        MethodDefinition statements = definition.method("statements", int.class).access(PUBLIC, STATIC);
+        for (int index = 0; index < 20; index++) {
+            statements.body().append(new SetupValue());
+        }
+        statements.body().ret(constantInt(42));
+
+        Parameter input = Parameter.arg("input", int.class);
+        MethodDefinition conditions = definition.method("conditions", boolean.class, input).access(PUBLIC, STATIC);
+        for (int index = 0; index < 20; index++) {
+            conditions.body().append(IfStatement.builder()
+                    .condition(new SetupCondition(input))
+                    .then(BytecodeExpressions.constantFalse().ret())
+                    .build());
+        }
+        conditions.body().ret(BytecodeExpressions.constantTrue());
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .hardMethodCodeLimit(4_000)
+                .targetMethodCodeLimit(64)
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(unit).primaryClass();
+
+        assertThat(generated.getMethod("statements").invoke(null)).isEqualTo(42);
+        assertThat(generated.getMethod("conditions", int.class).invoke(null, 0)).isEqualTo(false);
+        assertThat(generated.getMethod("conditions", int.class).invoke(null, 1)).isEqualTo(true);
+    }
+
     private static ClassDesc generatedClass(String suffix)
     {
         return ClassDesc.of(TestSyntheticExpressions.class.getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
@@ -142,6 +233,38 @@ class TestSyntheticExpressions
         public String toString()
         {
             return "offset(" + input + ")";
+        }
+    }
+
+    private static final class SetupValue
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return new ExpressionPlan(CodeBlock.block(constantInt(0).pop()), constantInt(1));
+        }
+    }
+
+    private record SetupCondition(BytecodeExpression input)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_boolean;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return new ExpressionPlan(CodeBlock.block(constantInt(0).pop()), input.equal(constantInt(0)));
         }
     }
 

@@ -13,7 +13,7 @@
     <packaging>jar</packaging>
 
     <name>Classfile</name>
-    <description>High-level declarative APIs for generating JVM class files with the Java 25 Class-File API</description>
+    <description>Declarative Java 25 runtime class generation with automatic code splitting</description>
     <url>https://github.com/airlift/classfile</url>
 
     <inceptionYear>2026</inceptionYear>

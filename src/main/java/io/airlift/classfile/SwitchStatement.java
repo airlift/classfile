@@ -19,6 +19,7 @@ import java.util.Comparator;
 import java.util.List;
 
 import static io.airlift.classfile.CodeBlock.block;
+import static io.airlift.classfile.Identity.same;
 import static java.util.Objects.requireNonNull;
 
 /// An immutable integer `switch` statement produced by [SwitchStatement#builder()].
@@ -71,6 +72,14 @@ public final class SwitchStatement
     public String description()
     {
         return description;
+    }
+
+    SwitchStatement rewrite(BytecodeExpression expression, List<Case> cases, CodeBlock defaultCase)
+    {
+        if (same(this.expression, expression) && this.cases.equals(cases) && same(this.defaultCase, defaultCase)) {
+            return this;
+        }
+        return new SwitchStatement(expression, cases, defaultCase, description);
     }
 
     @Override
