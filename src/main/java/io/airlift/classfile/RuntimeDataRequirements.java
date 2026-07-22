@@ -55,7 +55,7 @@ final class RuntimeDataRequirements
     {
         requireNonNull(configured, "configured is null");
         requireNonNull(compiled, "compiled is null");
-        if (configured.isPresent() && compiled.isPresent() && !configured.equals(compiled)) {
+        if (configured.isPresent() && compiled.isPresent() && !RuntimeData.sameClassData(configured, compiled)) {
             throw new IllegalArgumentException("Runtime data is incompatible");
         }
         return compiled.isPresent() ? compiled : configured;

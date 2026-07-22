@@ -14,9 +14,11 @@
 package io.airlift.classfile;
 
 import java.lang.constant.ClassDesc;
+import java.lang.constant.MethodTypeDesc;
 import java.lang.invoke.CallSite;
 import java.lang.invoke.ConstantCallSite;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandleInfo;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
@@ -71,6 +73,55 @@ public final class RuntimeBootstraps
         return type.cast(classData);
     }
 
+    public static CallSite hiddenClassLambdaMetafactory(
+            MethodHandles.Lookup lookup,
+            String methodName,
+            MethodType callSiteType,
+            String logicalOwnerDescriptor,
+            int referenceKind,
+            String implementationName,
+            String implementationDescriptor,
+            String samMethodDescriptor,
+            String instantiatedMethodDescriptor)
+            throws Throwable
+    {
+        requireNonNull(lookup, "lookup is null");
+        requireNonNull(methodName, "methodName is null");
+        requireNonNull(callSiteType, "callSiteType is null");
+        requireNonNull(logicalOwnerDescriptor, "logicalOwnerDescriptor is null");
+        requireNonNull(implementationName, "implementationName is null");
+        requireNonNull(implementationDescriptor, "implementationDescriptor is null");
+        requireNonNull(samMethodDescriptor, "samMethodDescriptor is null");
+        requireNonNull(instantiatedMethodDescriptor, "instantiatedMethodDescriptor is null");
+
+        Class<?> owner = lookup.lookupClass();
+        MethodType implementationType = resolveMethodType(lookup, logicalOwnerDescriptor, implementationDescriptor);
+        MethodHandle implementation = switch (referenceKind) {
+            case MethodHandleInfo.REF_invokeStatic -> lookup.findStatic(owner, implementationName, implementationType);
+            case MethodHandleInfo.REF_invokeVirtual, MethodHandleInfo.REF_invokeInterface -> lookup.findVirtual(owner, implementationName, implementationType);
+            case MethodHandleInfo.REF_invokeSpecial -> lookup.findSpecial(owner, implementationName, implementationType, owner);
+            case MethodHandleInfo.REF_newInvokeSpecial -> lookup.findConstructor(owner, implementationType);
+            default -> throw new IllegalArgumentException("Reference kind is not a method invocation: " + referenceKind);
+        };
+        MethodType safeImplementationType = eraseType(owner, implementation.type());
+        MethodType samMethodType = eraseType(owner, resolveMethodType(lookup, logicalOwnerDescriptor, samMethodDescriptor));
+        MethodType instantiatedMethodType = eraseType(owner, resolveMethodType(lookup, logicalOwnerDescriptor, instantiatedMethodDescriptor));
+
+        implementation = implementation.asType(safeImplementationType);
+
+        MethodHandle factory = lambdaFactory(lookup).factory(
+                methodName,
+                callSiteType,
+                samMethodType,
+                implementation,
+                instantiatedMethodType);
+        if (callSiteType.parameterCount() == 0) {
+            Object lambda = factory.invoke();
+            return new ConstantCallSite(MethodHandles.constant(callSiteType.returnType(), lambda));
+        }
+        return new ConstantCallSite(factory.asType(callSiteType));
+    }
+
     public static CallSite recordObjectMethod(
             MethodHandles.Lookup lookup,
             String methodName,
@@ -123,15 +174,63 @@ public final class RuntimeBootstraps
         return type.resolveConstantDesc(lookup);
     }
 
+    private static MethodType resolveMethodType(MethodHandles.Lookup lookup, String logicalOwnerDescriptor, String descriptor)
+            throws ReflectiveOperationException
+    {
+        MethodTypeDesc methodType = MethodTypeDesc.ofDescriptor(descriptor);
+        Class<?> returnType = resolveType(lookup, logicalOwnerDescriptor, methodType.returnType().descriptorString());
+        Class<?>[] parameterTypes = new Class<?>[methodType.parameterCount()];
+        for (int index = 0; index < parameterTypes.length; index++) {
+            parameterTypes[index] = resolveType(lookup, logicalOwnerDescriptor, methodType.parameterType(index).descriptorString());
+        }
+        return MethodType.methodType(returnType, parameterTypes);
+    }
+
+    private static MethodType eraseType(Class<?> logicalOwner, MethodType type)
+    {
+        Class<?> returnType = eraseType(logicalOwner, type.returnType());
+        Class<?>[] parameterTypes = type.parameterArray();
+        for (int index = 0; index < parameterTypes.length; index++) {
+            parameterTypes[index] = eraseType(logicalOwner, parameterTypes[index]);
+        }
+        return MethodType.methodType(returnType, parameterTypes);
+    }
+
+    private static Class<?> eraseType(Class<?> logicalOwner, Class<?> type)
+    {
+        Class<?> componentType = type;
+        while (componentType.isArray()) {
+            componentType = componentType.componentType();
+        }
+        return componentType == logicalOwner ? Object.class : type;
+    }
+
     private static RuntimeData runtimeData(MethodHandles.Lookup lookup)
             throws IllegalAccessException
     {
         if (lookup.lookupClass().isHidden()) {
-            return MethodHandles.classData(lookup, "_", RuntimeData.class);
+            Object data = MethodHandles.classData(lookup, "_", Object.class);
+            if (data instanceof HiddenClassRuntimeData hiddenData) {
+                return hiddenData.runtimeData();
+            }
+            return (RuntimeData) data;
         }
         if (lookup.lookupClass().getClassLoader() instanceof RuntimeDataProvider provider) {
             return provider.runtimeData(lookup.lookupClass());
         }
         throw new IllegalAccessException("Generated class loader does not expose runtime data");
+    }
+
+    private static LambdaFactory lambdaFactory(MethodHandles.Lookup lookup)
+            throws IllegalAccessException
+    {
+        if (!lookup.lookupClass().isHidden()) {
+            throw new IllegalAccessException("Hidden lambda linkage requires a hidden caller");
+        }
+        Object data = MethodHandles.classData(lookup, "_", Object.class);
+        if (data instanceof HiddenClassRuntimeData hiddenData) {
+            return hiddenData.lambdaFactory();
+        }
+        throw new IllegalAccessException("Hidden lambda linkage does not have a host factory");
     }
 }
