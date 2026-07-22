@@ -16,17 +16,43 @@ package io.airlift.classfile;
 import org.junit.jupiter.api.Test;
 
 import java.lang.constant.ClassDesc;
+import java.lang.constant.DirectMethodHandleDesc;
+import java.lang.constant.DynamicCallSiteDesc;
+import java.lang.constant.DynamicConstantDesc;
+import java.lang.constant.MethodHandleDesc;
+import java.lang.constant.MethodTypeDesc;
+import java.lang.invoke.CallSite;
+import java.lang.invoke.ConstantCallSite;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
+import static io.airlift.classfile.BytecodeExpressions.constantClass;
+import static io.airlift.classfile.BytecodeExpressions.constantDynamic;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
+import static io.airlift.classfile.BytecodeExpressions.constantNull;
+import static io.airlift.classfile.BytecodeExpressions.constantString;
+import static io.airlift.classfile.BytecodeExpressions.invokeDynamic;
 import static io.airlift.classfile.BytecodeExpressions.invokeLinked;
+import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
+import static io.airlift.classfile.BytecodeExpressions.newArray;
+import static io.airlift.classfile.DescriptorUtils.classDesc;
 import static io.airlift.classfile.Parameter.arg;
+import static java.lang.constant.ConstantDescs.CD_CallSite;
+import static java.lang.constant.ConstantDescs.CD_Class;
+import static java.lang.constant.ConstantDescs.CD_MethodHandles_Lookup;
+import static java.lang.constant.ConstantDescs.CD_MethodType;
+import static java.lang.constant.ConstantDescs.CD_Object;
+import static java.lang.constant.ConstantDescs.CD_String;
 import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.reflect.AccessFlag.FINAL;
@@ -444,6 +470,35 @@ class TestCompiledUnit
     }
 
     @Test
+    void testShardingPreservesExternalStaticInvocationOwner()
+            throws Exception
+    {
+        ClassDesc externalType = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedCollisionTarget" + NEXT_ID.incrementAndGet());
+        ClassDefinition external = ClassDefinition.define(externalType).access(PUBLIC, FINAL);
+        external.method("evaluate$expression$1", int.class).access(PUBLIC, STATIC).body().ret(constantInt(42));
+
+        ClassDesc primaryType = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedCollisionCaller" + NEXT_ID.incrementAndGet());
+        ClassDefinition primary = ClassDefinition.define(primaryType).access(PUBLIC, FINAL);
+        MethodDefinition evaluate = primary.method("evaluate", int.class).access(PUBLIC, STATIC);
+        BytecodeExpression value = invokeStatic(externalType, "evaluate$expression$1", CD_int);
+        for (int index = 0; index < 400; index++) {
+            value = value.add(constantInt(1));
+        }
+        evaluate.body().ret(value);
+        for (int method = 0; method < 96; method++) {
+            primary.method("large" + method, int.class).access(PUBLIC, STATIC).body().ret(largeConstantExpression(method));
+        }
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledUnit unit = compilerWithSmallMethodLimit(definer.compilationTarget())
+                .compileUnit(primary.build(), List.of(external.build()));
+        assertThat(unit.types()).hasSizeGreaterThan(2);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(442);
+    }
+
+    @Test
     void testConstructorInvocationArgumentsUseStaticExpressionHelpers()
             throws Exception
     {
@@ -532,6 +587,287 @@ class TestCompiledUnit
                 .hasMessageContaining("above the configured hard limit of 1 bytes");
     }
 
+    @Test
+    void testConstantPoolPressureCreatesCompanionClasses()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedConstants" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition touch = definition.method("touch", void.class).access(PUBLIC, STATIC);
+        for (int index = 0; index < 25_000; index++) {
+            touch.body().append(constantString("generated-constant-" + index).pop());
+        }
+        touch.body().ret();
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .compileUnit(definition.build());
+        assertThat(unit.types()).hasSizeGreaterThan(1);
+        assertThat(unit.report().classes())
+                .allSatisfy(classInfo -> assertThat(classInfo.constantPoolCount()).isLessThan(65_535));
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        generated.getMethod("touch").invoke(null);
+    }
+
+    @Test
+    void testBoundMethodHandlePressureCreatesCompanionClasses()
+            throws Throwable
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedBoundHandles" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int helperIndex = 0; helperIndex < helpers.length; helperIndex++) {
+            helpers[helperIndex] = definition.method("helper$expression$" + helperIndex, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            for (int bindingIndex = 0; bindingIndex < 500; bindingIndex++) {
+                MethodHandle handle = MethodHandles.constant(int.class, helperIndex * 500 + bindingIndex);
+                helpers[helperIndex].body().append(boundMethodHandle(handle).invoke().pop());
+            }
+            helpers[helperIndex].body().ret(constantInt(helperIndex));
+        }
+        definition.method("evaluate", int.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[0]));
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+
+        assertThat(unit.report().classes())
+                .hasSizeGreaterThan(2)
+                .allSatisfy(classInfo -> assertThat(classInfo.constantPoolCount()).isLessThan(65_535));
+        assertThat(definer.defineUnit(unit).primaryClass().getMethod("evaluate").invoke(null)).isEqualTo(0);
+    }
+
+    @Test
+    void testGeneratedLinksAreRewrittenThroughoutStructuredCode()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedStructuredLinks" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(constantInt(index));
+        }
+
+        Parameter input = arg("input", int.class);
+        MethodDefinition evaluate = definition.method("evaluate", int.class, input).access(PUBLIC, STATIC);
+        Variable result = evaluate.body().declare("result", constantInt(0));
+        evaluate.body()
+                .append(SwitchStatement.builder()
+                        .expression(input)
+                        .caseValue(0, result.set(invokeStatic(helpers[0])))
+                        .defaultCase(result.set(invokeStatic(helpers[1])))
+                        .build())
+                .append(TryCatch.builder()
+                        .tryBlock(result.set(result.add(invokeStatic(helpers[2]))))
+                        .catching(RuntimeException.class, "failure", (body, _) -> body.append(result.set(invokeStatic(helpers[3]))))
+                        .finallyBlock(result.set(result.add(invokeStatic(helpers[4]))))
+                        .build())
+                .ret(new LinkedSynthetic(result, helpers[5], helpers[6]));
+
+        ClassModel logicalModel = definition.build();
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()).policy(testPolicy()),
+                definer.compilationTarget(),
+                logicalModel,
+                helpers);
+        assertThat(unit.types()).hasSize(3);
+
+        DefinedUnit defined = definer.defineUnit(unit);
+        assertThat(defined.primaryClass().getMethod("evaluate", int.class).invoke(null, 0)).isEqualTo(17);
+        assertThat(defined.primaryClass().getMethod("evaluate", int.class).invoke(null, 1)).isEqualTo(18);
+    }
+
+    @Test
+    void testProtectedMembersPreventHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedProtectedAccess" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type)
+                .access(PUBLIC, FINAL)
+                .superClass(ProtectedBase.class);
+        Method protectedMethod = ProtectedBase.class.getDeclaredMethod("protectedValue");
+        Field protectedField = ProtectedBase.class.getDeclaredField("PROTECTED_FIELD");
+
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(index % 2 == 0 ? invokeStatic(protectedMethod) : BytecodeExpressions.getStatic(protectedField));
+        }
+        MethodDefinition evaluate = definition.method("evaluate", int.class).access(PUBLIC, STATIC);
+        evaluate.body().ret(invokeStatic(helpers[0]).add(invokeStatic(helpers[1])));
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(42);
+    }
+
+    @Test
+    void testInvokeDynamicPreventsHelperSharding()
+            throws Exception
+    {
+        DirectMethodHandleDesc bootstrap = MethodHandleDesc.ofMethod(
+                DirectMethodHandleDesc.Kind.STATIC,
+                classDesc(TestCompiledUnit.class),
+                "lookupClassCallSite",
+                MethodTypeDesc.of(CD_CallSite, CD_MethodHandles_Lookup, CD_String, CD_MethodType));
+        DynamicCallSiteDesc callSite = DynamicCallSiteDesc.of(bootstrap, "lookupClass", MethodTypeDesc.of(CD_Class));
+
+        assertLookupSensitiveExpression("InvokeDynamic", invokeDynamic(callSite));
+    }
+
+    @Test
+    void testDynamicConstantPreventsHelperSharding()
+            throws Exception
+    {
+        DirectMethodHandleDesc bootstrap = MethodHandleDesc.ofMethod(
+                DirectMethodHandleDesc.Kind.STATIC,
+                classDesc(TestCompiledUnit.class),
+                "lookupClassConstant",
+                MethodTypeDesc.of(CD_Object, CD_MethodHandles_Lookup, CD_String, CD_Class));
+        DynamicConstantDesc<?> constant = DynamicConstantDesc.ofNamed(bootstrap, "lookupClass", CD_Class);
+
+        assertLookupSensitiveExpression("DynamicConstant", constantDynamic(constant));
+    }
+
+    @Test
+    void testHiddenLogicalClassLiteralPreventsHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedHiddenClassLiteral" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, Class.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(index == 0 ? constantClass(type) : constantClass(Object.class));
+        }
+        definition.method("evaluate", Class.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[0]));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isSameAs(generated);
+    }
+
+    @Test
+    void testHiddenLogicalMethodDescriptorPreventsHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedHiddenDescriptor" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        Parameter value = arg("value", type);
+        helpers[0] = definition.method("helper$expression$0", int.class, value).access(PRIVATE, STATIC, SYNTHETIC);
+        helpers[0].body().ret(constantInt(42));
+        for (int index = 1; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(constantInt(index));
+        }
+        definition.method("evaluate", int.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[0], constantNull(type)));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(42);
+    }
+
+    @Test
+    void testCallerSensitiveMethodPreventsHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedCallerSensitive" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        definition.method("secret", int.class).access(PRIVATE, STATIC).body().ret(constantInt(42));
+
+        BytecodeExpression reflectedMethod = constantClass(type).invoke(
+                "getDeclaredMethod",
+                Method.class,
+                constantString("secret"),
+                newArray(Class[].class, 0));
+        BytecodeExpression reflectedValue = reflectedMethod.invoke(
+                        "invoke",
+                        Object.class,
+                        constantNull(Object.class),
+                        newArray(Object[].class, 0))
+                .cast(Integer.class)
+                .invoke("intValue", int.class);
+
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(index == 0 ? reflectedValue : constantInt(index));
+        }
+        definition.method("evaluate", int.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[0]));
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(42);
+    }
+
+    @Test
+    void testPublicMembersAllowHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedPublicAccess" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        Method absoluteValue = Math.class.getMethod("abs", int.class);
+
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(invokeStatic(absoluteValue, constantInt(-index)));
+        }
+        MethodDefinition evaluate = definition.method("evaluate", int.class).access(PUBLIC, STATIC);
+        evaluate.body().ret(invokeStatic(helpers[41]));
+
+        StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).hasSizeGreaterThan(1);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(41);
+    }
+
     private static BytecodeExpression largeConstantExpression(int initialValue)
     {
         BytecodeExpression expression = constantInt(initialValue);
@@ -539,6 +875,48 @@ class TestCompiledUnit
             expression = expression.add(constantInt(1));
         }
         return expression;
+    }
+
+    private static void assertLookupSensitiveExpression(String name, BytecodeExpression expression)
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".Generated" + name + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, Class.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(index == 0 ? expression : constantClass(Object.class));
+        }
+        MethodDefinition evaluate = definition.method("evaluate", Class.class).access(PUBLIC, STATIC);
+        evaluate.body().ret(invokeStatic(helpers[0]));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isSameAs(generated);
+    }
+
+    private static CompiledUnit compileSharded(
+            ClassCompiler compiler,
+            CompilationTarget target,
+            ClassModel model,
+            MethodDefinition[] helpers)
+    {
+        Set<String> generatedMethods = Set.copyOf(Arrays.stream(helpers)
+                .map(MethodDefinition::name)
+                .toList());
+        ClassSharder.Result sharded = ClassSharder.shard(
+                model,
+                generatedMethods,
+                new LinkageContext(target, List.of(model)));
+        return compiler.compileUnit(sharded.primary(), sharded.auxiliaries());
     }
 
     private static void appendLargeStatementRegion(MethodDefinition method, BytecodeExpression initialValue)
@@ -611,4 +989,50 @@ class TestCompiledUnit
     }
 
     private record Models(ClassModel primary, ClassModel helper) {}
+
+    private record LinkedSynthetic(Variable result, MethodDefinition valueHelper, MethodDefinition setupHelper)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return new ExpressionPlan(
+                    CodeBlock.block(result.set(result.add(invokeStatic(setupHelper)))),
+                    result.add(invokeStatic(valueHelper)));
+        }
+
+        @Override
+        public String toString()
+        {
+            return "linkedSynthetic(" + result + ")";
+        }
+    }
+
+    public static CallSite lookupClassCallSite(MethodHandles.Lookup lookup, String name, MethodType type)
+    {
+        return new ConstantCallSite(MethodHandles.constant(Class.class, lookup.lookupClass()).asType(type));
+    }
+
+    public static Object lookupClassConstant(MethodHandles.Lookup lookup, String name, Class<?> type)
+    {
+        return lookup.lookupClass();
+    }
+
+    public static class ProtectedBase
+    {
+        protected static final int PROTECTED_FIELD = 1;
+
+        protected ProtectedBase() {}
+
+        protected static int protectedValue()
+        {
+            return 41;
+        }
+    }
 }
