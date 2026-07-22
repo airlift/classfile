@@ -67,9 +67,9 @@ import static java.util.Objects.requireNonNull;
 /// Validates and compiles logical class models for a specific runtime linkage environment.
 ///
 /// A compiler is immutable. Configuration methods return a new compiler, and compilation never
-/// mutates the supplied logical model. [ClassCompiler#compileUnit(ClassModel)] additionally
-/// provides a physical compilation report and name-free linkage for supplied physical models;
-/// the simpler compiled forms retain their explicitly authored class boundaries.
+/// mutates the supplied logical model. [ClassCompiler#compileUnit(ClassModel)] additionally enables
+/// companion classes and name-free physical linkage; the simpler compiled forms retain their
+/// explicitly authored class boundaries.
 public final class ClassCompiler
 {
     private final CompilationTarget target;
@@ -114,8 +114,9 @@ public final class ClassCompiler
 
     /// Compiles one logical model to one classfile.
     ///
-    /// Large methods may be split into helper methods in the same class. Use
-    /// [ClassCompiler#compileUnit(ClassModel)] when a compilation report is desired.
+    /// Large methods may be split into helper methods in the same class, but this form never
+    /// creates companion classes. Use [ClassCompiler#compileUnit(ClassModel)] when physical helper
+    /// classes and a compilation report are desired.
     public CompiledClass compileClass(ClassModel definition)
     {
         requireNonNull(definition, "definition is null");
@@ -154,9 +155,15 @@ public final class ClassCompiler
         List<PlannedDefinition> plannedDefinitions = definitions.stream()
                 .map(this::plan)
                 .toList();
-        definitions = new ArrayList<>(plannedDefinitions.stream()
-                .map(PlannedDefinition::model)
-                .toList());
+        LinkageContext planningLinkage = new LinkageContext(target, plannedDefinitions.stream().map(PlannedDefinition::model).toList());
+
+        ArrayList<ClassModel> physicalDefinitions = new ArrayList<>(definitions.size());
+        for (PlannedDefinition definition : plannedDefinitions) {
+            ClassSharder.Result sharded = ClassSharder.shard(definition.model(), definition.generatedMethods(), planningLinkage);
+            physicalDefinitions.addAll(sharded.auxiliaries());
+            physicalDefinitions.add(sharded.primary());
+        }
+        definitions = physicalDefinitions;
 
         LinkageContext linkage = new LinkageContext(target, definitions);
         ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
@@ -209,8 +216,9 @@ public final class ClassCompiler
 
     /// Compiles explicitly authored nominal classes with shared runtime bindings.
     ///
-    /// Symbolic references between the classes remain ordinary named class references. Use
-    /// [ClassCompiler#compileUnit(ClassModel)] for physical-plan reporting and name-free links.
+    /// Symbolic references between the classes remain ordinary named class references. This form
+    /// does not introduce companion classes; use [ClassCompiler#compileUnit(ClassModel)] for
+    /// automatic physical class sharding.
     public CompiledClassBundle compileClassBundle(List<ClassModel> definitions)
     {
         definitions = List.copyOf(requireNonNull(definitions, "definitions is null"));
