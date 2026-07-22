@@ -48,9 +48,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 
 import static java.lang.classfile.TypeKind.DOUBLE;
@@ -92,8 +94,14 @@ public final class ClassCompiler
         LinkageContext linkage = new LinkageContext(target, List.of(definition));
         ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
         BindingCollector bindings = new BindingCollector();
-        byte[] classfile = emitClassfile(definition, bindings, classFile, linkage, classData);
-        return new CompiledClass(definition.type(), classfile, new RuntimeData(classData, bindings.values()));
+        EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+        return new CompiledClass(
+                target,
+                definition.type(),
+                emitted.classfile(),
+                new RuntimeData(classData, bindings.values()),
+                emitted.classDataTypes(),
+                emitted.lambdaFactoryRequired());
     }
 
     public CompiledClassBundle compileClassBundle(List<ClassModel> definitions)
@@ -107,32 +115,65 @@ public final class ClassCompiler
 
         BindingCollector bindings = new BindingCollector();
         LinkedHashMap<ClassDesc, byte[]> classfiles = new LinkedHashMap<>();
+        LinkedHashSet<ClassDesc> classDataTypes = new LinkedHashSet<>();
         for (ClassModel definition : definitions) {
             requireNonNull(definition, "definition is null");
             if (classfiles.containsKey(definition.type())) {
                 throw new IllegalArgumentException("Class is defined more than once: " + definition.type().displayName());
             }
-            classfiles.put(definition.type(), emitClassfile(definition, bindings, classFile, linkage, classData));
+            EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+            classfiles.put(definition.type(), emitted.classfile());
+            classDataTypes.addAll(emitted.classDataTypes());
         }
-        return new CompiledClassBundle(classfiles, new RuntimeData(classData, bindings.values()));
+        return new CompiledClassBundle(target, classfiles, new RuntimeData(classData, bindings.values()), classDataTypes);
     }
 
-    private static byte[] emitClassfile(ClassModel definition, BindingCollector bindings, ClassFile classFile, LinkageContext linkage, Optional<Object> classData)
+    private static EmittedClass emitClassfile(ClassModel definition, BindingCollector bindings, ClassFile classFile, LinkageContext linkage, Optional<Object> classData)
     {
         try {
-            LinkageValidator.validate(definition, linkage, classData);
+            linkage.requireGeneratedType(definition.type());
+            Set<ClassDesc> classDataTypes = LinkageValidator.validate(definition, linkage, classData);
             byte[] classfile = classFile.build(definition.type(), classBuilder -> emitClass(definition, classBuilder, bindings, linkage));
             List<VerifyError> errors = classFile.verify(classfile);
             if (!errors.isEmpty()) {
                 throw new CompilationException("Verification failed for " + definition.type().displayName() + ":\n" + ClassFileDiagnostics.disassemble(classfile));
             }
-            return classfile;
+            return new EmittedClass(classfile, classDataTypes, bindings.lambdaFactoryRequired());
         }
         catch (CompilationException e) {
             throw e;
         }
         catch (RuntimeException e) {
             throw new CompilationException("Failed to compile %s:%n%s".formatted(definition.type().displayName(), definition), e);
+        }
+    }
+
+    private static final class EmittedClass
+    {
+        private final byte[] classfile;
+        private final Set<ClassDesc> classDataTypes;
+        private final boolean lambdaFactoryRequired;
+
+        private EmittedClass(byte[] classfile, Set<ClassDesc> classDataTypes, boolean lambdaFactoryRequired)
+        {
+            this.classfile = requireNonNull(classfile, "classfile is null").clone();
+            this.classDataTypes = Set.copyOf(requireNonNull(classDataTypes, "classDataTypes is null"));
+            this.lambdaFactoryRequired = lambdaFactoryRequired;
+        }
+
+        private byte[] classfile()
+        {
+            return classfile.clone();
+        }
+
+        private Set<ClassDesc> classDataTypes()
+        {
+            return classDataTypes;
+        }
+
+        private boolean lambdaFactoryRequired()
+        {
+            return lambdaFactoryRequired;
         }
     }
 
@@ -550,8 +591,16 @@ public final class ClassCompiler
             }
             case ExpressionNode.BoundMethodHandleInvocation invocation -> emitBoundMethodHandle(invocation, context);
             case ExpressionNode.InvokeDynamic invokeDynamic -> {
-                emitArguments(invokeDynamic.arguments(), invokeDynamic.callSite().invocationType(), context);
-                context.code().invokedynamic(invokeDynamic.callSite());
+                DynamicCallSiteDesc callSite = invokeDynamic.callSite();
+                if (context.linkage().hiddenClass()) {
+                    DynamicCallSiteDesc rewritten = HiddenClassLinkage.rewrite(callSite, context.definition().type());
+                    if (!rewritten.equals(callSite)) {
+                        context.bindings().requireLambdaFactory();
+                    }
+                    callSite = rewritten;
+                }
+                emitArguments(invokeDynamic.arguments(), callSite.invocationType(), context);
+                context.code().invokedynamic(callSite);
             }
             case ExpressionNode.SetVariable setVariable -> {
                 emitExpressionAs(setVariable.value(), setVariable.variable().type(), context);
@@ -1219,6 +1268,17 @@ public final class ClassCompiler
         private final Map<Object, Integer> indexes = new IdentityHashMap<>();
         private final Map<MethodHandle, Map<MethodType, Integer>> adaptedHandleIndexes = new IdentityHashMap<>();
         private final ArrayList<Object> values = new ArrayList<>();
+        private boolean lambdaFactoryRequired;
+
+        private void requireLambdaFactory()
+        {
+            lambdaFactoryRequired = true;
+        }
+
+        private boolean lambdaFactoryRequired()
+        {
+            return lambdaFactoryRequired;
+        }
 
         private int bind(Object value)
         {

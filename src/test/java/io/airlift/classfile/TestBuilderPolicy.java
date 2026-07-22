@@ -21,6 +21,7 @@ import java.lang.classfile.MethodSignature;
 import java.lang.classfile.Signature;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.AccessFlag;
 import java.lang.reflect.Method;
 import java.util.List;
@@ -34,6 +35,7 @@ import static java.lang.constant.ConstantDescs.CD_Object;
 import static java.lang.constant.ConstantDescs.CD_String;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.constant.ConstantDescs.CD_void;
+import static java.lang.invoke.MethodHandles.Lookup.ClassOption.NESTMATE;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PUBLIC;
 import static java.lang.reflect.AccessFlag.STATIC;
@@ -200,6 +202,47 @@ class TestBuilderPolicy
     }
 
     @Test
+    void testRuntimeDefinerPropertiesAreSetOnce()
+    {
+        ClassLoader loader = getClass().getClassLoader();
+        RuntimeData runtimeData = RuntimeData.EMPTY;
+
+        StandardClassDefiner.Builder standard = StandardClassDefiner.builder(loader)
+                .overrideLoader(loader)
+                .runtimeData(runtimeData)
+                .initialize(false);
+        assertAlreadySet(() -> standard.overrideLoader(loader), "override loader is already set");
+        assertAlreadySet(() -> standard.runtimeData(runtimeData), "runtime data is already set");
+        assertAlreadySet(() -> standard.initialize(true), "initialize is already set");
+
+        HiddenClassDefiner.Builder hidden = HiddenClassDefiner.builder(MethodHandles.lookup())
+                .runtimeData(runtimeData)
+                .initialize(false)
+                .options(NESTMATE);
+        assertAlreadySet(() -> hidden.runtimeData(runtimeData), "runtime data is already set");
+        assertAlreadySet(() -> hidden.initialize(true), "initialize is already set");
+        assertAlreadySet(hidden::options, "options are already set");
+    }
+
+    @Test
+    void testRuntimeDataPublicApiDoesNotExposeCompilerBindings()
+    {
+        assertThat(RuntimeData.class.getConstructors()).isEmpty();
+        assertThat(RuntimeData.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("binding", "bindings");
+        assertThat(CompiledClass.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("runtimeData");
+        assertThat(CompiledClassBundle.class.getMethods())
+                .extracting(Method::getName)
+                .doesNotContain("runtimeData");
+
+        Object classData = new Object();
+        assertThat(RuntimeData.ofClassData(classData).classData()).containsSame(classData);
+    }
+
+    @Test
     void testFieldBuilderPropertiesAreSetOnceAndBuildRegistersField()
     {
         ClassDefinition classDefinition = ClassDefinition.define(ClassDesc.of("test.FieldBuilderPolicy"));
@@ -262,24 +305,6 @@ class TestBuilderPolicy
         assertAlreadySet(
                 () -> classDefinition.superClass(Object.class),
                 "super class cannot be set after the default constructor is declared");
-    }
-
-    @Test
-    void testRuntimeDataPublicApiDoesNotExposeCompilerBindings()
-    {
-        assertThat(RuntimeData.class.getConstructors()).isEmpty();
-        assertThat(RuntimeData.class.getMethods())
-                .extracting(Method::getName)
-                .doesNotContain("binding", "bindings");
-        assertThat(CompiledClass.class.getMethods())
-                .extracting(Method::getName)
-                .doesNotContain("runtimeData");
-        assertThat(CompiledClassBundle.class.getMethods())
-                .extracting(Method::getName)
-                .doesNotContain("runtimeData");
-
-        Object classData = new Object();
-        assertThat(RuntimeData.ofClassData(classData).classData()).containsSame(classData);
     }
 
     private static void assertAlreadySet(Runnable action, String message)

@@ -106,6 +106,16 @@ final class LinkageContext
         return hierarchyResolver;
     }
 
+    boolean hiddenClass()
+    {
+        return target.hiddenClass();
+    }
+
+    void requireGeneratedType(ClassDesc type)
+    {
+        target.requireGeneratedType(type);
+    }
+
     boolean isInterface(ClassDesc type)
     {
         return ClassHierarchyResolver.ClassHierarchyInfo.ofInterface()

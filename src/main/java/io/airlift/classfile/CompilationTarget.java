@@ -19,10 +19,12 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Modifier;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 
 import static io.airlift.classfile.Identity.same;
+import static java.lang.invoke.MethodHandles.Lookup.ClassOption.NESTMATE;
 import static java.util.Objects.requireNonNull;
 
 /// Describes the runtime environment in which generated classes will be linked.
@@ -34,25 +36,27 @@ public final class CompilationTarget
 {
     private final TypeResolver typeResolver;
     private final ClassHierarchyResolver hierarchyResolver;
+    private final Object identity;
     private final String description;
     private final boolean hiddenClass;
 
-    private CompilationTarget(TypeResolver typeResolver, ClassHierarchyResolver hierarchyResolver, String description, boolean hiddenClass)
+    private CompilationTarget(TypeResolver typeResolver, ClassHierarchyResolver hierarchyResolver, Object identity, String description, boolean hiddenClass)
     {
         this.typeResolver = requireNonNull(typeResolver, "typeResolver is null");
         this.hierarchyResolver = requireNonNull(hierarchyResolver, "hierarchyResolver is null");
+        this.identity = requireNonNull(identity, "identity is null");
         this.description = requireNonNull(description, "description is null");
         this.hiddenClass = hiddenClass;
     }
 
-    /// Creates a target for nominal classes defined by the supplied loader or a child generated
-    /// loader with equivalent visibility.
+    /// Creates a target for nominal classes defined by the supplied loader.
     public static CompilationTarget forClassLoader(ClassLoader classLoader)
     {
         requireNonNull(classLoader, "classLoader is null");
         return new CompilationTarget(
                 new ClassLoaderResolver(classLoader),
                 ClassHierarchyResolver.ofClassLoading(classLoader),
+                classLoader,
                 "class loader " + identity(classLoader),
                 false);
     }
@@ -60,12 +64,35 @@ public final class CompilationTarget
     /// Creates a target for hidden classes defined through the supplied host lookup.
     public static CompilationTarget forLookup(MethodHandles.Lookup lookup)
     {
+        return forLookup(lookup, new MethodHandles.Lookup.ClassOption[0]);
+    }
+
+    /// Creates a target for hidden classes defined through the supplied host lookup and options.
+    public static CompilationTarget forLookup(MethodHandles.Lookup lookup, MethodHandles.Lookup.ClassOption... options)
+    {
         requireNonNull(lookup, "lookup is null");
+        options = requireNonNull(options, "options is null").clone();
+        Arrays.stream(options).forEach(option -> requireNonNull(option, "option is null"));
+        if (!lookup.hasFullPrivilegeAccess()) {
+            throw new IllegalArgumentException("Hidden class lookup must have full privilege access: " + lookup);
+        }
+        boolean nestmate = Arrays.asList(options).contains(NESTMATE);
         return new CompilationTarget(
                 new LookupResolver(lookup),
                 ClassHierarchyResolver.ofClassLoading(lookup),
-                "lookup " + lookup.lookupClass().getName(),
+                new LookupIdentity(lookup.lookupClass(), lookup.previousLookupClass(), lookup.lookupModes(), nestmate),
+                "lookup " + lookup.lookupClass().getName() + (nestmate ? " with nestmate access" : ""),
                 true);
+    }
+
+    /// Verifies that this target and the supplied target describe the same definition environment.
+    public void requireCompatibleWith(CompilationTarget target)
+    {
+        requireNonNull(target, "target is null");
+        boolean sameIdentity = hiddenClass ? identity.equals(target.identity) : same(identity, target.identity);
+        if (hiddenClass != target.hiddenClass || !sameIdentity) {
+            throw new IllegalArgumentException("Artifact compiled for %s cannot be defined by %s".formatted(description, target.description));
+        }
     }
 
     ClassHierarchyResolver hierarchyResolver()
@@ -76,6 +103,20 @@ public final class CompilationTarget
     boolean hiddenClass()
     {
         return hiddenClass;
+    }
+
+    void requireGeneratedType(ClassDesc type)
+    {
+        requireNonNull(type, "type is null");
+        if (!hiddenClass) {
+            return;
+        }
+        MethodHandles.Lookup lookup = ((LookupResolver) typeResolver).lookup();
+        String lookupPackage = lookup.lookupClass().getPackageName();
+        if (!type.packageName().equals(lookupPackage)) {
+            throw new CompilationException("Hidden class %s must be in lookup package %s"
+                    .formatted(type.displayName(), lookupPackage));
+        }
     }
 
     Optional<Class<?>> resolveClass(ClassDesc type)
@@ -164,6 +205,12 @@ public final class CompilationTarget
         return value.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(value));
     }
 
+    @Override
+    public String toString()
+    {
+        return description;
+    }
+
     record AdaptedMethodHandle(MethodHandle handle, MethodType type)
     {
         AdaptedMethodHandle
@@ -172,6 +219,8 @@ public final class CompilationTarget
             requireNonNull(type, "type is null");
         }
     }
+
+    private record LookupIdentity(Class<?> lookupClass, Class<?> previousLookupClass, int lookupModes, boolean nestmate) {}
 
     private interface TypeResolver
     {

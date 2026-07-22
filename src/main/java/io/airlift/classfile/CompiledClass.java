@@ -14,6 +14,7 @@
 package io.airlift.classfile;
 
 import java.lang.constant.ClassDesc;
+import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
 
@@ -25,15 +26,32 @@ import static java.util.Objects.requireNonNull;
 /// bindings owned by the compiler.
 public final class CompiledClass
 {
+    private final CompilationTarget target;
     private final ClassDesc type;
     private final byte[] classfile;
     private final RuntimeData runtimeData;
+    private final Set<ClassDesc> classDataTypes;
+    private final boolean lambdaFactoryRequired;
 
-    public CompiledClass(ClassDesc type, byte[] classfile, RuntimeData runtimeData)
+    CompiledClass(
+            CompilationTarget target,
+            ClassDesc type,
+            byte[] classfile,
+            RuntimeData runtimeData,
+            Set<ClassDesc> classDataTypes,
+            boolean lambdaFactoryRequired)
     {
+        this.target = requireNonNull(target, "target is null");
         this.type = requireNonNull(type, "type is null");
         this.classfile = requireNonNull(classfile, "classfile is null").clone();
         this.runtimeData = requireNonNull(runtimeData, "runtimeData is null");
+        this.classDataTypes = Set.copyOf(requireNonNull(classDataTypes, "classDataTypes is null"));
+        this.lambdaFactoryRequired = lambdaFactoryRequired;
+    }
+
+    public CompilationTarget target()
+    {
+        return target;
     }
 
     public ClassDesc type()
@@ -50,5 +68,17 @@ public final class CompiledClass
     RuntimeData runtimeData()
     {
         return runtimeData;
+    }
+
+    /// Returns whether hidden definition must install the loader-owned lambda factory.
+    boolean lambdaFactoryRequired()
+    {
+        return lambdaFactoryRequired;
+    }
+
+    /// Validates the effective runtime data that will be installed for this artifact.
+    void validateRuntimeData(RuntimeData runtimeData)
+    {
+        RuntimeDataRequirements.validate(target, type, Set.of(type), classDataTypes, runtimeData);
     }
 }
