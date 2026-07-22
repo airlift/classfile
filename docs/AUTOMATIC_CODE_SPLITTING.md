@@ -24,6 +24,8 @@ and the generated code preserves Java evaluation order, exceptions, side effects
 short-circuiting, and lexical variable values.
 
 This document explains the physical planning performed by `compileUnit(...)`.
+General class authoring and loading are covered by
+[`USER_GUIDE.md`](USER_GUIDE.md).
 
 ## Why Splitting Is Automatic
 
