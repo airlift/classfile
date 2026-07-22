@@ -51,6 +51,43 @@ class TestStructuredControlFlow
                 .hasMessage("Structured statement nesting exceeds the supported limit of " + StructuredDepth.MAX_NESTING);
     }
 
+    @Test
+    void testDeepRecursiveSyntheticExpressionDoesNotOverflowValidationStack()
+    {
+        RecursiveSyntheticExpression recursive = new RecursiveSyntheticExpression();
+        BytecodeExpression expression = recursive;
+        for (int index = 0; index < 10_000; index++) {
+            expression = expression.add(constantInt(1));
+        }
+
+        StructuredDepth.validate(expression.ret());
+        assertThat(recursive.expansions()).isEqualTo(1);
+    }
+
+    private static final class RecursiveSyntheticExpression
+            implements SyntheticExpression
+    {
+        private int expansions;
+
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            expansions++;
+            return ExpressionPlan.value(this);
+        }
+
+        public int expansions()
+        {
+            return expansions;
+        }
+    }
+
     private static final AtomicLong NEXT_CLASS_ID = new AtomicLong();
 
     @Test
