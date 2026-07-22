@@ -198,6 +198,14 @@ public class BenchmarkGeneratedExecution
                     .flatMap(classInfo -> classInfo.methods().stream())
                     .filter(method -> method.name().startsWith("valueIdentical$blocks$"))
                     .count();
+            if (flatHashShape == FlatHashShape.MIXED && planning == FlatHashPlanning.DEFAULT && helpers == 0) {
+                ExpressionPlanner.Metrics metrics = ExpressionPlanner.metrics(model.methods().stream()
+                        .filter(method -> method.name().equals("valueIdentical"))
+                        .findFirst()
+                        .orElseThrow()
+                        .body());
+                throw new IllegalStateException("Mixed invocation-dense shape did not split: " + metrics);
+            }
             if (planning == FlatHashPlanning.NO_COMPLEXITY_SPLITTING && helpers != 0) {
                 throw new IllegalStateException("No-complexity control split unexpectedly");
             }

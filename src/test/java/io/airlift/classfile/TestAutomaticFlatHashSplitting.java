@@ -19,13 +19,18 @@ import java.lang.constant.ClassDesc;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 
+import static io.airlift.classfile.BytecodeExpressions.boundConstant;
 import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.BytecodeExpressions.constantFalse;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
+import static io.airlift.classfile.BytecodeExpressions.constantNull;
 import static io.airlift.classfile.BytecodeExpressions.constantTrue;
 import static io.airlift.classfile.BytecodeExpressions.inlineIf;
 import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
@@ -42,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class TestAutomaticFlatHashSplitting
 {
     private static final AtomicLong NEXT_ID = new AtomicLong();
+    private static final ThreadLocal<List<Integer>> IDENTICAL_CALLS = ThreadLocal.withInitial(ArrayList::new);
     private static final int NULL_VALUE = Integer.MIN_VALUE;
 
     @Test
@@ -147,6 +153,221 @@ public class TestAutomaticFlatHashSplitting
         assertThat((boolean) valueIdentical.invokeExact(leftValues, rightValues, 0)).isTrue();
         rightValues[fieldCount - 1] = new IntValueBlock(1);
         assertThat((boolean) valueIdentical.invokeExact(leftValues, rightValues, 0)).isFalse();
+    }
+
+    @Test
+    void testCommonWidthMixedBoundHandleBlocksSplitForJitComplexity()
+            throws Throwable
+    {
+        CompilationPolicy ordinaryPolicy = new CompilationPolicy(65_535, 7_200, 35, 325, true);
+        CompilationPolicy hugeMethodPolicy = new CompilationPolicy(65_535, 65_535, 35, 325, false);
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        for (int fieldCount : List.of(32, 50, 64)) {
+            for (CompilationPolicy policy : List.of(ordinaryPolicy, hugeMethodPolicy)) {
+                CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                        .policy(policy)
+                        .compileUnit(mixedIdenticalModel(fieldCount, true));
+                List<CompilationReport.MethodInfo> helpers = unit.report().classes().getFirst().methods().stream()
+                        .filter(methodInfo -> methodInfo.name().startsWith("valueIdentical$blocks$"))
+                        .toList();
+                assertThat(helpers)
+                        .as("fieldCount=%s policy=%s", fieldCount, policy)
+                        .hasSizeGreaterThanOrEqualTo(3)
+                        .allSatisfy(methodInfo -> assertThat(methodInfo.codeBytes()).isLessThanOrEqualTo(3_600));
+                assertThat(unit.report().classes().getFirst().methods())
+                        .extracting(CompilationReport.MethodInfo::name)
+                        .noneMatch(name -> name.startsWith("valueIdentical$statements$") || name.startsWith("valueIdentical$conditions$"));
+
+                DefinedUnit hidden = HiddenClassDefiner.builder(lookup).build().defineUnit(unit);
+                assertMixedIdenticalBehavior(hidden, fieldCount);
+            }
+        }
+    }
+
+    @Test
+    void testCallFreeScopedBlocksRemainFlat()
+            throws Throwable
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedType("CallFreeScopedBlocks", 24)).access(PUBLIC, FINAL);
+        MethodDefinition method = definition.method("apply", int.class).access(PUBLIC, STATIC);
+        Variable value = method.body().declare("value", constantInt(0));
+        for (int block = 0; block < 24; block++) {
+            CodeBlock.Builder statements = blockBuilder();
+            for (int increment = 0; increment < 50; increment++) {
+                statements.append(value.increment());
+            }
+            method.body().append(statements.build());
+        }
+        method.body().ret(value);
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompilationPolicy policy = new CompilationPolicy(65_535, 7_200, 35, 325, true);
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().getFirst().methods())
+                .extracting(CompilationReport.MethodInfo::name)
+                .containsExactly("apply");
+        DefinedUnit hidden = HiddenClassDefiner.builder(lookup).build().defineUnit(unit);
+        MethodHandle apply = hidden.primaryLookup().orElseThrow().findStatic(hidden.primaryClass(), "apply", MethodType.methodType(int.class));
+        assertThat((int) apply.invokeExact()).isEqualTo(1_200);
+    }
+
+    private static ClassModel mixedIdenticalModel(int fieldCount, boolean comments)
+            throws ReflectiveOperationException
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedType("FlatHashMixedIdentical", fieldCount)).access(PUBLIC, FINAL);
+        Parameter leftFixed = arg("leftFixed", byte[].class);
+        Parameter leftFixedOffset = arg("leftFixedOffset", int.class);
+        Parameter leftVariable = arg("leftVariable", byte[].class);
+        Parameter leftVariableOffset = arg("leftVariableOffset", int.class);
+        Parameter rightBlocks = arg("rightBlocks", ValueBlock[].class);
+        Parameter rightPosition = arg("rightPosition", int.class);
+        MethodDefinition method = definition.method(
+                        "valueIdentical",
+                        boolean.class,
+                        leftFixed,
+                        leftFixedOffset,
+                        leftVariable,
+                        leftVariableOffset,
+                        rightBlocks,
+                        rightPosition)
+                .access(PUBLIC, STATIC);
+        Variable currentVariableOffset = method.body().declare("currentVariableOffset", leftVariableOffset);
+        if (fieldCount == 32) {
+            Variable unrelated = method.body().declare("unrelated", constantInt(0));
+            method.body()
+                    .append(unrelated.set(unrelated.add(constantInt(1))))
+                    .append(unrelated.set(unrelated.add(constantInt(1))));
+        }
+        MethodHandle identical = MethodHandles.lookup().findStatic(
+                TestAutomaticFlatHashSplitting.class,
+                "identicalFlatBlock",
+                MethodType.methodType(boolean.class, int.class, byte[].class, int.class, byte[].class, int.class, ValueBlock.class, int.class));
+        VariableLayout variableLayout = new VariableLayout();
+        for (int field = 0; field < fieldCount; field++) {
+            boolean variableWidth = (field & 1) != 0;
+            CodeBlock.Builder identicalBlock = blockBuilder();
+            Variable rightBlock = identicalBlock.declare("rightBlock", rightBlocks.getElement(field));
+            Variable leftIsNull = identicalBlock.declare(
+                    "leftIsNull",
+                    leftFixed.getElement(leftFixedOffset.add(constantInt(field * 2))).cast(int.class).notEqual(constantInt(0)));
+            Variable rightIsNull = identicalBlock.declare("rightIsNull", rightBlock.invoke("isNull", boolean.class, rightPosition));
+
+            BytecodeExpression variableData = variableWidth ? leftVariable : constantNull(byte[].class);
+            BytecodeExpression variableOffset = variableWidth ? currentVariableOffset : constantInt(0);
+            BytecodeExpression nextOffset = variableWidth
+                    ? currentVariableOffset.add(boundConstant(variableLayout, VariableLayout.class).invoke(
+                    "length",
+                    int.class,
+                    leftFixed,
+                    leftFixedOffset.add(constantInt(field * 2 + 1))))
+                    : currentVariableOffset;
+            CodeBlock compareNonNull = block(currentVariableOffset.set(inlineIf(
+                    boundMethodHandle(identical).invoke(
+                            constantInt(field),
+                            leftFixed,
+                            leftFixedOffset.add(constantInt(field * 2 + 1)),
+                            variableData,
+                            variableOffset,
+                            rightBlock,
+                            rightPosition),
+                    nextOffset,
+                    constantInt(-1))));
+            identicalBlock.append(IfStatement.builder()
+                    .condition(leftIsNull)
+                    .then(block(currentVariableOffset.set(inlineIf(rightIsNull, currentVariableOffset, constantInt(-1)))))
+                    .otherwise(block(IfStatement.builder()
+                            .condition(rightIsNull)
+                            .then(block(currentVariableOffset.set(constantInt(-1))))
+                            .otherwise(compareNonNull)
+                            .build()))
+                    .build());
+            method.body().append(block(IfStatement.builder()
+                    .condition(currentVariableOffset.greaterThanOrEqual(constantInt(0)))
+                    .then(identicalBlock.build())
+                    .build()));
+            if (comments) {
+                method.body().comment("field " + field);
+            }
+        }
+        method.body().ret(currentVariableOffset.greaterThanOrEqual(constantInt(0)));
+        return definition.build();
+    }
+
+    private static void assertMixedIdenticalBehavior(DefinedUnit hidden, int fieldCount)
+            throws Throwable
+    {
+        MethodHandle valueIdentical = hidden.primaryLookup().orElseThrow().findStatic(
+                hidden.primaryClass(),
+                "valueIdentical",
+                MethodType.methodType(boolean.class, byte[].class, int.class, byte[].class, int.class, ValueBlock[].class, int.class));
+        int fixedOffset = 3;
+        int variableOffset = 2;
+        int position = 1;
+        byte[] leftFixedValues = new byte[fixedOffset + fieldCount * 2];
+        byte[] leftVariableValues = new byte[variableOffset + fieldCount / 2];
+        ValueBlock[] rightValues = new ValueBlock[fieldCount];
+        for (int field = 0; field < fieldCount; field++) {
+            byte fixedValue = (byte) (field + 3);
+            leftFixedValues[fixedOffset + field * 2 + 1] = fixedValue;
+            int expected = fixedValue;
+            if ((field & 1) != 0) {
+                leftVariableValues[variableOffset + field / 2] = 7;
+                expected += 7;
+            }
+            rightValues[field] = new TestValueBlock(position, expected, false);
+        }
+
+        int nullField = fieldCount / 3;
+        leftFixedValues[fixedOffset + nullField * 2] = 1;
+        rightValues[nullField] = new TestValueBlock(position, 0, true);
+        assertInvocation(valueIdentical, leftFixedValues, fixedOffset, leftVariableValues, variableOffset, rightValues, position, true);
+        assertThat(IDENTICAL_CALLS.get()).containsExactlyElementsOf(IntStream.range(0, fieldCount).filter(field -> field != nullField).boxed().toList());
+
+        rightValues[0] = new TestValueBlock(position, 999, false);
+        assertInvocation(valueIdentical, leftFixedValues, fixedOffset, leftVariableValues, variableOffset, rightValues, position, false);
+        assertThat(IDENTICAL_CALLS.get()).containsExactly(0);
+        rightValues[0] = new TestValueBlock(position, leftFixedValues[fixedOffset + 1], false);
+
+        int afterHelperBoundary = fieldCount / 2;
+        rightValues[afterHelperBoundary] = new TestValueBlock(position, 999, false);
+        assertInvocation(valueIdentical, leftFixedValues, fixedOffset, leftVariableValues, variableOffset, rightValues, position, false);
+        assertThat(IDENTICAL_CALLS.get().getLast()).isEqualTo(afterHelperBoundary);
+        rightValues[afterHelperBoundary] = expectedBlock(leftFixedValues, fixedOffset, leftVariableValues, variableOffset, afterHelperBoundary, position);
+
+        rightValues[fieldCount - 1] = new TestValueBlock(position, 999, false);
+        assertInvocation(valueIdentical, leftFixedValues, fixedOffset, leftVariableValues, variableOffset, rightValues, position, false);
+        assertThat(IDENTICAL_CALLS.get().getLast()).isEqualTo(fieldCount - 1);
+
+        leftFixedValues[fixedOffset] = 1;
+        rightValues[0] = new TestValueBlock(position, 0, false);
+        assertInvocation(valueIdentical, leftFixedValues, fixedOffset, leftVariableValues, variableOffset, rightValues, position, false);
+        assertThat(IDENTICAL_CALLS.get()).isEmpty();
+    }
+
+    private static TestValueBlock expectedBlock(byte[] fixed, int fixedOffset, byte[] variable, int variableOffset, int field, int position)
+    {
+        int expected = fixed[fixedOffset + field * 2 + 1];
+        if ((field & 1) != 0) {
+            expected += variable[variableOffset + field / 2];
+        }
+        return new TestValueBlock(position, expected, false);
+    }
+
+    private static void assertInvocation(
+            MethodHandle valueIdentical,
+            byte[] fixed,
+            int fixedOffset,
+            byte[] variable,
+            int variableOffset,
+            ValueBlock[] blocks,
+            int position,
+            boolean expected)
+            throws Throwable
+    {
+        IDENTICAL_CALLS.get().clear();
+        assertThat((boolean) valueIdentical.invokeExact(fixed, fixedOffset, variable, variableOffset, blocks, position)).isEqualTo(expected);
     }
 
     private static ClassModel flatHashModel(int fieldCount)
@@ -386,6 +607,24 @@ public class TestAutomaticFlatHashSplitting
         return left[offset] == right.getInt(position);
     }
 
+    public static boolean identicalFlatBlock(int field, byte[] fixed, int fixedOffset, byte[] variable, int variableOffset, ValueBlock right, int position)
+    {
+        IDENTICAL_CALLS.get().add(field);
+        int value = fixed[fixedOffset];
+        if (variable != null) {
+            value += variable[variableOffset];
+        }
+        return value == right.getInt(position);
+    }
+
+    public static final class VariableLayout
+    {
+        public int length(byte[] fixed, int fixedOffset)
+        {
+            return 1;
+        }
+    }
+
     public interface ValueBlock
     {
         boolean isNull(int position);
@@ -405,6 +644,27 @@ public class TestAutomaticFlatHashSplitting
         @Override
         public int getInt(int position)
         {
+            return value;
+        }
+    }
+
+    private record TestValueBlock(int expectedPosition, int value, boolean nullValue)
+            implements ValueBlock
+    {
+        @Override
+        public boolean isNull(int position)
+        {
+            assertThat(position).isEqualTo(expectedPosition);
+            return nullValue;
+        }
+
+        @Override
+        public int getInt(int position)
+        {
+            assertThat(position).isEqualTo(expectedPosition);
+            if (nullValue) {
+                throw new AssertionError("null value was read");
+            }
             return value;
         }
     }

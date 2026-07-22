@@ -41,6 +41,8 @@ final class StatementPlanner
     // JIT target selected by CompilationPolicy.
     private static final int METHOD_ESTIMATE_TO_CODE_BUDGET_RATIO = 3;
     private static final int REGION_ESTIMATE_TO_CODE_BUDGET_RATIO = 2;
+    private static final int JIT_COMPLEXITY_ESTIMATE_BUDGET = 7_200;
+    private static final int MIN_COMPLEX_INVOCATIONS_PER_BLOCK = 2;
     private static final int MAX_CONTINUATION_DEPTH = 256;
 
     private StatementPlanner() {}
@@ -53,6 +55,8 @@ final class StatementPlanner
                 Math.max(64, policy.targetMethodCodeLimit() * METHOD_ESTIMATE_TO_CODE_BUDGET_RATIO),
                 Math.max(64, policy.targetMethodCodeLimit() * REGION_ESTIMATE_TO_CODE_BUDGET_RATIO),
                 Math.max(1, policy.hardMethodCodeLimit() * 9 / 10),
+                policy.targetMethodCodeLimit(),
+                policy.frequentInlineSize(),
                 hiddenClass,
                 expressionHelpers,
                 definition.methods().stream().map(MethodDefinition.Model::name).collect(Collectors.toSet()));
@@ -87,6 +91,9 @@ final class StatementPlanner
         private final int methodBudget;
         private final int regionBudget;
         private final int continuationHardEstimateBudget;
+        private final int complexSequenceBudget;
+        private final int complexRegionBudget;
+        private final int complexBlockEstimate;
         private final boolean hiddenClass;
         private final Set<String> expressionHelpers;
         private final ArrayList<MethodDefinition.Model> helpers = new ArrayList<>();
@@ -99,6 +106,8 @@ final class StatementPlanner
                 int methodBudget,
                 int regionBudget,
                 int continuationHardEstimateBudget,
+                int targetMethodCodeLimit,
+                int frequentInlineSize,
                 boolean hiddenClass,
                 Set<String> expressionHelpers,
                 Set<String> usedMethodNames)
@@ -107,6 +116,12 @@ final class StatementPlanner
             this.methodBudget = methodBudget;
             this.regionBudget = regionBudget;
             this.continuationHardEstimateBudget = continuationHardEstimateBudget;
+            this.complexSequenceBudget = Math.min(targetMethodCodeLimit, JIT_COMPLEXITY_ESTIMATE_BUDGET);
+            this.complexRegionBudget = Math.max(64, complexSequenceBudget * 2 / 3);
+            // Repeated, invocation-dense scoped blocks can exhaust C2's graph and inlining budgets
+            // before reaching the ordinary huge-method target. Disable this secondary trigger for
+            // intentionally tiny policies where it would dominate the authored target.
+            this.complexBlockEstimate = complexSequenceBudget > frequentInlineSize * 2 ? frequentInlineSize : Integer.MAX_VALUE;
             this.hiddenClass = hiddenClass;
             this.expressionHelpers = Set.copyOf(expressionHelpers);
             this.usedMethodNames = new LinkedHashSet<>(usedMethodNames);
@@ -122,26 +137,73 @@ final class StatementPlanner
             if (!method.hasBody() || method.isConstructor() || method.isClassInitializer() || expressionHelpers.contains(method.name())) {
                 return method;
             }
-            if (ExpressionPlanner.estimate(method.body()) <= triggerBudget) {
+            BodyAnalysis analysis = analyze(method.body());
+            boolean ordinaryPlanning = analysis.estimate() > triggerBudget;
+            boolean complexBlocks = analysis.complexScopedBlocks();
+            if (!ordinaryPlanning && !complexBlocks) {
                 return method;
             }
             CodeBlock plannedBody = planSyntheticSetups(method, method.body());
             MethodDefinition.Model plannedMethod = same(plannedBody, method.body()) ? method : copy(method, plannedBody);
-            if (ExpressionPlanner.estimate(plannedBody) <= triggerBudget) {
+            if (different(plannedBody, method.body())) {
+                analysis = analyze(plannedBody);
+            }
+            ordinaryPlanning = analysis.estimate() > triggerBudget;
+            complexBlocks = analysis.complexScopedBlocks();
+            if (!ordinaryPlanning && !complexBlocks) {
                 return plannedMethod;
             }
-            CodeBlock branchBody = extractBranches(plannedMethod, plannedBody, triggerBudget);
+            CodeBlock branchBody = ordinaryPlanning ? extractBranches(plannedMethod, plannedBody, triggerBudget) : plannedBody;
             if (different(branchBody, plannedBody)) {
                 plannedMethod = copy(plannedMethod, branchBody);
-                if (ExpressionPlanner.estimate(branchBody) <= triggerBudget) {
+                analysis = analyze(branchBody);
+                ordinaryPlanning = analysis.estimate() > triggerBudget;
+                complexBlocks = analysis.complexScopedBlocks();
+                if (!ordinaryPlanning && !complexBlocks) {
                     return plannedMethod;
                 }
             }
-            CodeBlock body = extract(plannedMethod, List.of());
+            CodeBlock body = extract(plannedMethod, List.of(), !ordinaryPlanning);
             if (same(body, plannedMethod.body())) {
                 return plannedMethod;
             }
             return copy(plannedMethod, body);
+        }
+
+        private BodyAnalysis analyze(CodeBlock body)
+        {
+            int bodyEstimate = 0;
+            int count = 0;
+            int estimate = 0;
+            int invocations = 0;
+            boolean complexScopedBlocks = false;
+            for (Statement statement : body.statements()) {
+                ExpressionPlanner.Metrics metrics = ExpressionPlanner.metrics(statement);
+                bodyEstimate += metrics.estimate();
+                if (statement instanceof Statements.Comment) {
+                    continue;
+                }
+                if (!(statement instanceof CodeBlock block) || !isExtractableBlock(block)) {
+                    complexScopedBlocks |= isComplexScopedBlockSequence(count, estimate, invocations);
+                    count = 0;
+                    estimate = 0;
+                    invocations = 0;
+                    continue;
+                }
+                count++;
+                estimate += metrics.estimate();
+                invocations += metrics.invocations();
+            }
+            complexScopedBlocks |= isComplexScopedBlockSequence(count, estimate, invocations);
+            return new BodyAnalysis(bodyEstimate, complexScopedBlocks);
+        }
+
+        private boolean isComplexScopedBlockSequence(int count, int estimate, int invocations)
+        {
+            return count >= 2 &&
+                    estimate > complexSequenceBudget &&
+                    (long) estimate > (long) complexBlockEstimate * count &&
+                    invocations >= count * MIN_COMPLEX_INVOCATIONS_PER_BLOCK;
         }
 
         private CodeBlock extractBranches(MethodDefinition.Model method, CodeBlock block, int triggerBudget)
@@ -330,7 +392,7 @@ final class StatementPlanner
                     CodeBlock setup = planSyntheticSetups(method, plan.setup());
                     BytecodeExpression value = planSyntheticSetups(method, plan.value());
                     if (ExpressionPlanner.estimate(setup) > methodBudget) {
-                        setup = extract(copy(method, setup), ExpressionPlanner.locals(value));
+                        setup = extract(copy(method, setup), ExpressionPlanner.locals(value), false);
                     }
                     if (same(setup, plan.setup()) && same(value, plan.value())) {
                         yield synthetic;
@@ -346,10 +408,10 @@ final class StatementPlanner
             };
         }
 
-        private CodeBlock extract(MethodDefinition.Model method, List<? extends LocalValue> liveAfterBody)
+        private CodeBlock extract(MethodDefinition.Model method, List<? extends LocalValue> liveAfterBody, boolean scopedBlocksOnly)
         {
             List<Statement> source = method.body().statements();
-            Optional<ContinuationExtraction> trailingContinuation = extractTrailingContinuation(method, source);
+            Optional<ContinuationExtraction> trailingContinuation = scopedBlocksOnly ? Optional.empty() : extractTrailingContinuation(method, source);
             if (trailingContinuation.isPresent()) {
                 ContinuationExtraction extraction = trailingContinuation.orElseThrow();
                 ArrayList<Statement> rewritten = new ArrayList<>(source.subList(0, extraction.start()));
@@ -359,7 +421,7 @@ final class StatementPlanner
             ArrayList<Statement> result = new ArrayList<>();
             boolean changed = trailingContinuation.isPresent();
             for (int index = 0; index < source.size(); ) {
-                Optional<Boolean> earlyReturnValue = orderedEarlyBooleanReturn(source.get(index));
+                Optional<Boolean> earlyReturnValue = scopedBlocksOnly ? Optional.empty() : orderedEarlyBooleanReturn(source.get(index));
                 if (earlyReturnValue.isPresent()) {
                     boolean returnValue = earlyReturnValue.orElseThrow();
                     int end = index;
@@ -382,27 +444,49 @@ final class StatementPlanner
                         }
                     }
                 }
-                if (source.get(index) instanceof CodeBlock block && isExtractableBlock(block)) {
-                    int end = index;
-                    int estimated = 0;
-                    while (end < source.size() && source.get(end) instanceof CodeBlock candidate && isExtractableBlock(candidate)) {
-                        int candidateEstimate = ExpressionPlanner.estimate(candidate);
-                        if (end > index && estimated + candidateEstimate > regionBudget) {
-                            break;
+                Optional<ScopedBlockRun> scopedBlockRun = scopedBlockRun(source, index);
+                if (scopedBlockRun.isPresent()) {
+                    ScopedBlockRun run = scopedBlockRun.orElseThrow();
+                    int totalEstimate = run.blocks().stream().mapToInt(block -> block.metrics().estimate()).sum();
+                    int totalInvocations = run.blocks().stream().mapToInt(block -> block.metrics().invocations()).sum();
+                    boolean complex = isComplexScopedBlockSequence(run.blocks().size(), totalEstimate, totalInvocations);
+                    if (!scopedBlocksOnly || complex) {
+                        int extractionBudget = complex ? complexRegionBudget : regionBudget;
+                        int blockIndex = 0;
+                        int sourceIndex = index;
+                        while (blockIndex < run.blocks().size()) {
+                            int blockEnd = blockIndex;
+                            int estimated = 0;
+                            while (blockEnd < run.blocks().size()) {
+                                int candidateEstimate = run.blocks().get(blockEnd).metrics().estimate();
+                                if (blockEnd > blockIndex && estimated + candidateEstimate > extractionBudget) {
+                                    break;
+                                }
+                                estimated += candidateEstimate;
+                                blockEnd++;
+                            }
+                            ScopedBlock last = run.blocks().get(blockEnd - 1);
+                            List<CodeBlock> region = run.blocks().subList(blockIndex, blockEnd).stream()
+                                    .map(ScopedBlock::block)
+                                    .toList();
+                            Optional<Statement> invocation = extractBlocks(method, region, source.subList(last.sourceEnd(), source.size()), liveAfterBody);
+                            if (invocation.isPresent()) {
+                                result.add(invocation.orElseThrow());
+                                changed = true;
+                            }
+                            else {
+                                result.addAll(source.subList(sourceIndex, last.sourceEnd()));
+                            }
+                            sourceIndex = last.sourceEnd();
+                            blockIndex = blockEnd;
                         }
-                        estimated += candidateEstimate;
-                        end++;
-                    }
-                    List<CodeBlock> region = source.subList(index, end).stream()
-                            .map(CodeBlock.class::cast)
-                            .toList();
-                    Optional<Statement> invocation = extractBlocks(method, region, source.subList(end, source.size()), liveAfterBody);
-                    if (invocation.isPresent()) {
-                        result.add(invocation.orElseThrow());
-                        changed = true;
-                        index = end;
+                        index = run.sourceEnd();
                         continue;
                     }
+                }
+                if (scopedBlocksOnly) {
+                    result.add(source.get(index++));
+                    continue;
                 }
                 if (!isSimpleExpression(source.get(index))) {
                     result.add(source.get(index++));
@@ -441,6 +525,31 @@ final class StatementPlanner
                 index = end;
             }
             return changed ? method.body().withStatements(result) : method.body();
+        }
+
+        private static Optional<ScopedBlockRun> scopedBlockRun(List<Statement> source, int index)
+        {
+            if (!(source.get(index) instanceof CodeBlock first) || !isExtractableBlock(first)) {
+                return Optional.empty();
+            }
+
+            ArrayList<ScopedBlock> blocks = new ArrayList<>();
+            for (int end = index; end < source.size(); end++) {
+                Statement statement = source.get(end);
+                if (statement instanceof CodeBlock block && isExtractableBlock(block)) {
+                    blocks.add(new ScopedBlock(block, ExpressionPlanner.metrics(block), end + 1));
+                    continue;
+                }
+                if (statement instanceof Statements.Comment comment) {
+                    ScopedBlock previous = blocks.removeLast();
+                    ArrayList<Statement> statements = new ArrayList<>(previous.block().statements());
+                    statements.add(comment);
+                    blocks.add(new ScopedBlock(previous.block().withStatements(statements), previous.metrics(), end + 1));
+                    continue;
+                }
+                break;
+            }
+            return Optional.of(new ScopedBlockRun(List.copyOf(blocks), blocks.getLast().sourceEnd()));
         }
 
         private Optional<ContinuationExtraction> extractTrailingContinuation(MethodDefinition.Model method, List<Statement> source)
@@ -914,6 +1023,12 @@ final class StatementPlanner
         private record Continuation(String name, MethodTypeDesc methodType) {}
 
         private record ContinuationExtraction(int start, Statement invocation) {}
+
+        private record BodyAnalysis(int estimate, boolean complexScopedBlocks) {}
+
+        private record ScopedBlock(CodeBlock block, ExpressionPlanner.Metrics metrics, int sourceEnd) {}
+
+        private record ScopedBlockRun(List<ScopedBlock> blocks, int sourceEnd) {}
 
         private record PlannedSyntheticExpression(ClassDesc type, CodeBlock setup, BytecodeExpression value, String rendering)
                 implements SyntheticExpression
