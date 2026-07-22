@@ -359,10 +359,12 @@ final class StatementPlanner
             ArrayList<Statement> result = new ArrayList<>();
             boolean changed = trailingContinuation.isPresent();
             for (int index = 0; index < source.size(); ) {
-                if (isEarlyFalseReturn(source.get(index))) {
+                Optional<Boolean> earlyReturnValue = orderedEarlyBooleanReturn(source.get(index));
+                if (earlyReturnValue.isPresent()) {
+                    boolean returnValue = earlyReturnValue.orElseThrow();
                     int end = index;
                     int estimated = 0;
-                    while (end < source.size() && isEarlyFalseReturn(source.get(end))) {
+                    while (end < source.size() && orderedEarlyBooleanReturn(source.get(end)).filter(value -> value == returnValue).isPresent()) {
                         int candidateEstimate = ExpressionPlanner.estimate(source.get(end));
                         if (end > index && estimated + candidateEstimate > regionBudget) {
                             break;
@@ -371,7 +373,7 @@ final class StatementPlanner
                         end++;
                     }
                     if (end - index >= 2) {
-                        Optional<Statement> continuation = extractConditions(method, source.subList(index, end));
+                        Optional<Statement> continuation = extractConditions(method, source.subList(index, end), returnValue);
                         if (continuation.isPresent()) {
                             result.add(continuation.orElseThrow());
                             changed = true;
@@ -618,16 +620,33 @@ final class StatementPlanner
                     .formatted(method.name(), method.methodType().descriptorString(), desiredDepth, MAX_CONTINUATION_DEPTH));
         }
 
-        private Optional<Statement> extractConditions(MethodDefinition.Model method, List<Statement> region)
+        private Optional<Statement> extractConditions(MethodDefinition.Model method, List<Statement> region, boolean earlyReturnValue)
         {
+            LinkedHashSet<Variable> declarations = new LinkedHashSet<>();
+            region.forEach(statement -> collectDeclarations(statement, declarations));
+
             LinkedHashSet<LocalValue> locals = new LinkedHashSet<>();
-            region.stream()
-                    .map(IfStatement.class::cast)
-                    .forEach(statement -> locals.addAll(ExpressionPlanner.locals(statement.condition())));
+            region.forEach(statement -> {
+                if (statement instanceof IfStatement ifStatement) {
+                    locals.addAll(ExpressionPlanner.locals(ifStatement.condition()));
+                }
+                else {
+                    locals.addAll(ExpressionPlanner.locals(statement));
+                }
+            });
+            locals.removeAll(declarations);
             Optional<Variable> receiver = hiddenReceiver(method, locals);
             if (hasUnsupportedOwnerLocal(locals, receiver)) {
                 return Optional.empty();
             }
+
+            LinkedHashSet<Variable> writes = new LinkedHashSet<>();
+            region.forEach(statement -> collectWrittenVariables(statement, writes));
+            writes.removeAll(declarations);
+            if (!writes.isEmpty()) {
+                return Optional.empty();
+            }
+
             int parameterSlots = locals.stream().mapToInt(local -> ExpressionPlanner.slotSize(local.type())).sum();
             if (parameterSlots > 255) {
                 return Optional.empty();
@@ -658,13 +677,17 @@ final class StatementPlanner
             }
             helper.comment("ordered early-return conditions extracted from " + method.name());
             for (Statement statement : region) {
-                IfStatement ifStatement = (IfStatement) statement;
-                helper.body().append(IfStatement.builder()
-                        .condition(ExpressionPlanner.rewrite(ifStatement.condition(), replacements::get))
-                        .then(BytecodeExpressions.constantFalse().ret())
-                        .build());
+                if (statement instanceof IfStatement ifStatement) {
+                    helper.body().append(IfStatement.builder()
+                            .condition(ExpressionPlanner.rewrite(ifStatement.condition(), replacements::get))
+                            .then(BytecodeExpressions.constantBoolean(earlyReturnValue).ret())
+                            .build());
+                }
+                else {
+                    helper.body().append(ExpressionPlanner.rewrite((CodeBlock) statement, local -> replacements.getOrDefault(local, local)));
+                }
             }
-            helper.body().ret(BytecodeExpressions.constantTrue());
+            helper.body().ret(BytecodeExpressions.constantBoolean(!earlyReturnValue));
             helpers.add(helper.build());
             names.add(methodName);
 
@@ -672,9 +695,10 @@ final class StatementPlanner
             BytecodeExpression call = receiver
                     .map(value -> value.invokeSpecial(owner, methodName, helper.methodType(), arguments))
                     .orElseGet(() -> BytecodeExpressions.invokeStatic(owner, methodName, helper.methodType(), arguments));
+            BytecodeExpression condition = earlyReturnValue ? call : call.not();
             return Optional.of(IfStatement.builder()
-                    .condition(call.not())
-                    .then(BytecodeExpressions.constantFalse().ret())
+                    .condition(condition)
+                    .then(BytecodeExpressions.constantBoolean(earlyReturnValue).ret())
                     .build());
         }
 
@@ -1098,25 +1122,115 @@ final class StatementPlanner
         }
     }
 
-    private static boolean isEarlyFalseReturn(Statement statement)
+    private static Optional<Boolean> orderedEarlyBooleanReturn(Statement statement)
+    {
+        Optional<Boolean> directReturn = earlyBooleanReturnValue(statement);
+        if (directReturn.isPresent()) {
+            return directReturn;
+        }
+        if (!(statement instanceof CodeBlock block) || !isExtractableConditionBlock(block)) {
+            return Optional.empty();
+        }
+        LinkedHashSet<Boolean> returnValues = new LinkedHashSet<>();
+        collectBooleanReturnValues(block, returnValues);
+        if (returnValues.size() != 1) {
+            return Optional.empty();
+        }
+        return Optional.of(returnValues.getFirst());
+    }
+
+    private static boolean isExtractableConditionBlock(CodeBlock block)
+    {
+        return block.statements().stream().allMatch(StatementPlanner::isExtractableConditionStatement);
+    }
+
+    private static boolean isExtractableConditionStatement(Statement statement)
+    {
+        return switch (statement) {
+            case BytecodeExpression expression -> isExtractableConditionExpression(expression);
+            case Statements.Expression expression -> isExtractableConditionExpression(expression.expression());
+            case Statements.InitializedDeclaration declaration -> isExtractableExpression(declaration.initializer());
+            case Statements.Declaration _,
+                 Statements.Comment _ -> true;
+            case CodeBlock block -> isExtractableConditionBlock(block);
+            case IfStatement value -> isExtractableExpression(value.condition()) &&
+                    isExtractableConditionBlock(value.ifTrue()) &&
+                    isExtractableConditionBlock(value.ifFalse());
+            case DoWhileLoop _,
+                 ForLoop _,
+                 LoopJump _,
+                 SwitchStatement _,
+                 TryCatch _,
+                 WhileLoop _,
+                 Statements.ConstructorInvocation _,
+                 Statements.Jump _,
+                 Statements.LabelBinding _ -> false;
+        };
+    }
+
+    private static boolean isExtractableConditionExpression(BytecodeExpression expression)
+    {
+        if (booleanReturnValue(expression).isPresent()) {
+            return true;
+        }
+        if (expression instanceof CoreExpression core && core.node() instanceof ExpressionNode.Adapter adapter && adapter.keyword().equals("throw")) {
+            return isExtractableExpression(adapter.value());
+        }
+        return isExtractableExpression(expression);
+    }
+
+    private static void collectBooleanReturnValues(Statement statement, Set<Boolean> returnValues)
+    {
+        switch (statement) {
+            case BytecodeExpression expression -> booleanReturnValue(expression).ifPresent(returnValues::add);
+            case Statements.Expression expression -> booleanReturnValue(expression.expression()).ifPresent(returnValues::add);
+            case CodeBlock block -> block.statements().forEach(value -> collectBooleanReturnValues(value, returnValues));
+            case IfStatement value -> {
+                collectBooleanReturnValues(value.ifTrue(), returnValues);
+                collectBooleanReturnValues(value.ifFalse(), returnValues);
+            }
+            case Statements.InitializedDeclaration _,
+                 Statements.Declaration _,
+                 Statements.Comment _,
+                 DoWhileLoop _,
+                 ForLoop _,
+                 LoopJump _,
+                 SwitchStatement _,
+                 TryCatch _,
+                 WhileLoop _,
+                 Statements.ConstructorInvocation _,
+                 Statements.Jump _,
+                 Statements.LabelBinding _ -> {}
+        }
+    }
+
+    private static Optional<Boolean> earlyBooleanReturnValue(Statement statement)
     {
         if (!(statement instanceof IfStatement ifStatement) || !ifStatement.ifFalse().isEmpty() || ifStatement.ifTrue().statements().size() != 1) {
-            return false;
+            return Optional.empty();
         }
         if (!ExpressionPlanner.canRewriteValue(ifStatement.condition())) {
-            return false;
+            return Optional.empty();
         }
         Statement body = ifStatement.ifTrue().statements().getFirst();
-        if (!(body instanceof Statements.Expression(CoreExpression core))) {
-            return false;
+        if (!(body instanceof Statements.Expression expression)) {
+            return Optional.empty();
         }
-        if (!(core.node() instanceof ExpressionNode.Adapter adapter) || !adapter.keyword().equals("return")) {
-            return false;
-        }
-        return adapter.value() instanceof CoreExpression value &&
+        return booleanReturnValue(expression.expression());
+    }
+
+    private static Optional<Boolean> booleanReturnValue(BytecodeExpression expression)
+    {
+        if (expression instanceof CoreExpression core &&
+                core.node() instanceof ExpressionNode.Adapter adapter &&
+                adapter.keyword().equals("return") &&
+                adapter.value() instanceof CoreExpression value &&
                 value.node() instanceof ExpressionNode.Constant constant &&
                 constant.type().equals(ConstantDescs.CD_boolean) &&
-                Boolean.FALSE.equals(constant.value());
+                constant.value() instanceof Boolean booleanValue) {
+            return Optional.of(booleanValue);
+        }
+        return Optional.empty();
     }
 
     private static Optional<BytecodeExpression> returnValue(Statement statement)
