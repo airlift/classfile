@@ -153,6 +153,9 @@ class TestRuntimeDefiners
 
         Parameter staticValue = arg("value", Long.class);
         MethodDefinition staticTarget = classDefinition.method("staticLambda", Long.class, staticValue).access(PRIVATE, STATIC);
+        for (int index = 0; index < 100; index++) {
+            staticTarget.body().append(constantInt(index).pop());
+        }
         staticTarget.body().ret(staticValue);
         MethodHandleDesc staticImplementation = MethodHandleDesc.ofMethod(
                 DirectMethodHandleDesc.Kind.STATIC,
@@ -189,7 +192,29 @@ class TestRuntimeDefiners
 
         classDefinition.constructor().access(PUBLIC).body().invokeSuperConstructor().ret();
 
-        Class<?> generated = HiddenClassDefiner.builder(MethodHandles.lookup()).build().defineClass(classDefinition.build()).lookupClass();
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .targetMethodCodeLimit(7_200)
+                .maxInlineSize(35)
+                .frequentInlineSize(325)
+                .build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .policy(policy)
+                .compileUnit(classDefinition.build());
+        assertThat(unit.report().classes().getFirst().methods())
+                .filteredOn(method -> method.name().equals("lambda") || method.name().equals("primitiveLambda"))
+                .allSatisfy(method -> assertThat(method.codeBytes()).isLessThan(unit.report().policy().frequentInlineSize()));
+        assertThat(unit.report().classes().getFirst().methods())
+                .filteredOn(method -> method.name().equals("staticLambda"))
+                .singleElement()
+                .satisfies(method -> assertThat(method.codeBytes())
+                        .isGreaterThan(unit.report().policy().frequentInlineSize())
+                        .isLessThanOrEqualTo(unit.report().policy().frequentInlineSize() + 2));
+        assertThat(unit.report().classes().getFirst().methods())
+                .filteredOn(method -> method.name().equals("get") || method.name().equals("getStatic") || method.name().equals("getPrimitive"))
+                .allSatisfy(method -> assertThat(method.codeBytes()).isLessThan(unit.report().policy().frequentInlineSize()));
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
         Object instance = generated.getConstructor().newInstance();
         @SuppressWarnings("unchecked")
         Function<Long, Long> function = (Function<Long, Long>) generated.getMethod("get").invoke(instance);

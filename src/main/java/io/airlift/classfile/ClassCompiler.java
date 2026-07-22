@@ -56,6 +56,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 import static java.lang.classfile.TypeKind.DOUBLE;
 import static java.lang.classfile.TypeKind.FLOAT;
@@ -124,11 +125,12 @@ public final class ClassCompiler
     public CompiledClass compileClass(ClassModel definition)
     {
         requireNonNull(definition, "definition is null");
-        ClassModel physicalDefinition = plan(definition).model();
+        PlannedDefinition planned = plan(definition);
+        ClassModel physicalDefinition = planned.model();
         LinkageContext linkage = new LinkageContext(target, List.of(physicalDefinition));
         ClassFile classFile = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(linkage.hierarchyResolver()));
         BindingCollector bindings = new BindingCollector();
-        EmittedClass emitted = emitClassfile(physicalDefinition, bindings, classFile, linkage, classData);
+        EmittedClass emitted = emitClassfile(physicalDefinition, bindings, classFile, linkage, classData, planned.lambdaImplementations());
         enforceHardMethodLimit(List.of(emitted.classInfo()));
         return new CompiledClass(
                 target,
@@ -159,6 +161,10 @@ public final class ClassCompiler
         List<PlannedDefinition> plannedDefinitions = definitions.stream()
                 .map(this::plan)
                 .toList();
+        Map<ClassDesc, Set<HiddenClassLinkage.MethodReference>> lambdaImplementations = plannedDefinitions.stream()
+                .collect(Collectors.toMap(
+                        definition -> definition.model().type(),
+                        PlannedDefinition::lambdaImplementations));
         LinkageContext planningLinkage = new LinkageContext(target, plannedDefinitions.stream().map(PlannedDefinition::model).toList());
 
         ArrayList<ClassModel> physicalDefinitions = new ArrayList<>(definitions.size());
@@ -179,7 +185,13 @@ public final class ClassCompiler
                 throw new IllegalArgumentException("Class is defined more than once: " + definition.type().displayName());
             }
             BindingCollector bindings = new BindingCollector();
-            EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+            EmittedClass emitted = emitClassfile(
+                    definition,
+                    bindings,
+                    classFile,
+                    linkage,
+                    classData,
+                    lambdaImplementations.getOrDefault(definition.type(), Set.of()));
             artifacts.add(new CompiledUnit.Artifact(
                     definition.type(),
                     emitted.classfile(),
@@ -213,10 +225,13 @@ public final class ClassCompiler
         StatementPlanner.Result statements = StatementPlanner.plan(expressions.model(), policy, Set.copyOf(expressions.generatedMethods()), target.hiddenClass());
         LinkedHashSet<String> generatedMethods = new LinkedHashSet<>(expressions.generatedMethods());
         generatedMethods.addAll(statements.generatedMethods());
-        return new PlannedDefinition(statements.model(), Set.copyOf(generatedMethods));
+        return new PlannedDefinition(statements.model(), Set.copyOf(generatedMethods), expressions.lambdaImplementations());
     }
 
-    private record PlannedDefinition(ClassModel model, Set<String> generatedMethods) {}
+    private record PlannedDefinition(
+            ClassModel model,
+            Set<String> generatedMethods,
+            Set<HiddenClassLinkage.MethodReference> lambdaImplementations) {}
 
     /// Compiles explicitly authored nominal classes with shared runtime bindings.
     ///
@@ -229,8 +244,14 @@ public final class ClassCompiler
         if (definitions.isEmpty()) {
             throw new IllegalArgumentException("definitions is empty");
         }
-        definitions = definitions.stream()
+        List<PlannedDefinition> plannedDefinitions = definitions.stream()
                 .map(this::plan)
+                .toList();
+        Map<ClassDesc, Set<HiddenClassLinkage.MethodReference>> lambdaImplementations = plannedDefinitions.stream()
+                .collect(Collectors.toMap(
+                        definition -> definition.model().type(),
+                        PlannedDefinition::lambdaImplementations));
+        definitions = plannedDefinitions.stream()
                 .map(PlannedDefinition::model)
                 .toList();
         LinkageContext linkage = new LinkageContext(target, definitions);
@@ -245,7 +266,13 @@ public final class ClassCompiler
             if (classfiles.containsKey(definition.type())) {
                 throw new IllegalArgumentException("Class is defined more than once: " + definition.type().displayName());
             }
-            EmittedClass emitted = emitClassfile(definition, bindings, classFile, linkage, classData);
+            EmittedClass emitted = emitClassfile(
+                    definition,
+                    bindings,
+                    classFile,
+                    linkage,
+                    classData,
+                    lambdaImplementations.getOrDefault(definition.type(), Set.of()));
             classfiles.put(definition.type(), emitted.classfile());
             classDataTypes.addAll(emitted.classDataTypes());
             classInfos.add(emitted.classInfo());
@@ -272,13 +299,27 @@ public final class ClassCompiler
         return measured;
     }
 
-    private static EmittedClass emitClassfile(ClassModel definition, BindingCollector bindings, ClassFile classFile, LinkageContext linkage, Optional<Object> classData)
+    private EmittedClass emitClassfile(
+            ClassModel definition,
+            BindingCollector bindings,
+            ClassFile classFile,
+            LinkageContext linkage,
+            Optional<Object> classData,
+            Set<HiddenClassLinkage.MethodReference> lambdaImplementations)
     {
         try {
             linkage.requireGeneratedType(definition.type());
             Set<ClassDesc> classDataTypes = LinkageValidator.validate(definition, linkage, classData);
-            byte[] classfile = classFile.build(definition.type(), classBuilder -> emitClass(definition, classBuilder, bindings, linkage));
+            byte[] classfile = buildClassfile(definition, bindings, classFile, linkage, Map.of());
             java.lang.classfile.ClassModel parsedClassfile = classFile.parse(classfile);
+            CompilationReport.ClassInfo classInfo = CompilationReport.measure(definition.type(), classfile, parsedClassfile);
+
+            Map<HiddenClassLinkage.MethodReference, Integer> lambdaBoundaryPadding = lambdaBoundaryPadding(classInfo, lambdaImplementations);
+            if (!lambdaBoundaryPadding.isEmpty()) {
+                classfile = buildClassfile(definition, bindings, classFile, linkage, lambdaBoundaryPadding);
+                parsedClassfile = classFile.parse(classfile);
+                classInfo = CompilationReport.measure(definition.type(), classfile, parsedClassfile);
+            }
             List<VerifyError> errors = classFile.verify(parsedClassfile);
             if (!errors.isEmpty()) {
                 throw new CompilationException("Verification failed for " + definition.type().displayName() + ":\n" + ClassFileDiagnostics.disassemble(classfile));
@@ -287,7 +328,7 @@ public final class ClassCompiler
                     classfile,
                     classDataTypes,
                     bindings.lambdaFactoryRequired(),
-                    CompilationReport.measure(definition.type(), classfile, parsedClassfile));
+                    classInfo);
         }
         catch (CompilationException e) {
             throw e;
@@ -295,6 +336,47 @@ public final class ClassCompiler
         catch (RuntimeException e) {
             throw new CompilationException("Failed to compile %s:%n%s".formatted(definition.type().displayName(), definition), e);
         }
+    }
+
+    private static byte[] buildClassfile(
+            ClassModel definition,
+            BindingCollector bindings,
+            ClassFile classFile,
+            LinkageContext linkage,
+            Map<HiddenClassLinkage.MethodReference, Integer> lambdaBoundaryPadding)
+    {
+        return classFile.build(definition.type(), classBuilder -> emitClass(
+                definition,
+                classBuilder,
+                bindings,
+                linkage,
+                lambdaBoundaryPadding));
+    }
+
+    private Map<HiddenClassLinkage.MethodReference, Integer> lambdaBoundaryPadding(
+            CompilationReport.ClassInfo classInfo,
+            Set<HiddenClassLinkage.MethodReference> lambdaImplementations)
+    {
+        if (lambdaImplementations.isEmpty() || policy.frequentInlineSize() >= policy.targetMethodCodeLimit()) {
+            return Map.of();
+        }
+
+        // Small hidden lambda targets must remain inlineable so their captures can be scalar
+        // replaced. Targets in the upper half of HotSpot's hot-inlining window are large enough
+        // to inflate an already nontrivial consumer compilation, so keep only those as ordinary
+        // compiled method boundaries. Measure emitted Code rather than relying on the planner's
+        // deliberately approximate size estimate.
+        int boundaryTrigger = policy.maxInlineSize() + (policy.frequentInlineSize() - policy.maxInlineSize()) / 2;
+        LinkedHashMap<HiddenClassLinkage.MethodReference, Integer> padding = new LinkedHashMap<>();
+        for (CompilationReport.MethodInfo method : classInfo.methods()) {
+            HiddenClassLinkage.MethodReference reference = new HiddenClassLinkage.MethodReference(method.name(), method.type());
+            if (lambdaImplementations.contains(reference) &&
+                    method.codeBytes() > boundaryTrigger &&
+                    method.codeBytes() <= policy.frequentInlineSize()) {
+                padding.put(reference, policy.frequentInlineSize() - method.codeBytes() + 1);
+            }
+        }
+        return Map.copyOf(padding);
     }
 
     private static final class EmittedClass
@@ -333,7 +415,12 @@ public final class ClassCompiler
         }
     }
 
-    private static void emitClass(ClassModel definition, ClassBuilder builder, BindingCollector bindings, LinkageContext linkage)
+    private static void emitClass(
+            ClassModel definition,
+            ClassBuilder builder,
+            BindingCollector bindings,
+            LinkageContext linkage,
+            Map<HiddenClassLinkage.MethodReference, Integer> lambdaBoundaryPadding)
     {
         builder.withFlags(classAccess(definition.access()))
                 .withSuperclass(definition.superClass())
@@ -396,7 +483,8 @@ public final class ClassCompiler
                     }
                 }
                 if (method.hasBody()) {
-                    methodBuilder.withCode(code -> emitMethod(definition, method, code, bindings, linkage));
+                    int padding = lambdaBoundaryPadding.getOrDefault(new HiddenClassLinkage.MethodReference(method.name(), method.methodType()), 0);
+                    methodBuilder.withCode(code -> emitMethod(definition, method, code, bindings, linkage, padding));
                 }
             });
         }
@@ -415,8 +503,15 @@ public final class ClassCompiler
         return RecordComponentInfo.of(component.name(), component.type(), attributes);
     }
 
-    private static void emitMethod(ClassModel definition, MethodDefinition.Model method, CodeBuilder code, BindingCollector bindings, LinkageContext linkage)
+    private static void emitMethod(ClassModel definition, MethodDefinition.Model method, CodeBuilder code, BindingCollector bindings, LinkageContext linkage, int jitBoundaryPadding)
     {
+        // There is no public VM annotation for retaining a hidden lambda implementation as an
+        // ordinary compilation boundary. Add only the measured padding needed to cross the
+        // observed hot-call inline threshold; the separately compiled implementation optimizes
+        // these harmless stack operations away.
+        for (int emittedBytes = 0; emittedBytes < jitBoundaryPadding; emittedBytes += 2) {
+            code.loadConstant(0).pop();
+        }
         EmitContext context = new EmitContext(definition, method, code, bindings, linkage);
         emitBlock(method.body(), context, false);
         if (method.isClassInitializer()) {
