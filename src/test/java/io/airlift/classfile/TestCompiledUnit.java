@@ -868,6 +868,63 @@ class TestCompiledUnit
         assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(41);
     }
 
+    @Test
+    void testOrderedGeneratedDependenciesAllowHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedOrderedDependencies" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+            helpers[index].body().ret(index == 0 ? constantInt(0) : invokeStatic(helpers[index - 1]).add(constantInt(1)));
+        }
+        definition.method("evaluate", int.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[96]));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).hasSizeGreaterThan(1);
+
+        DefinedUnit definedUnit = definer.defineUnit(unit);
+        assertThat(definedUnit.types())
+                .allSatisfy(generatedType -> assertThat(definedUnit.definedClass(generatedType).isHidden()).isTrue());
+        assertThat(definedUnit.primaryClass().getMethod("evaluate").invoke(null)).isEqualTo(96);
+    }
+
+    @Test
+    void testForwardGeneratedDependencyPreventsHelperSharding()
+            throws Exception
+    {
+        ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedForwardDependency" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        MethodDefinition[] helpers = new MethodDefinition[97];
+        for (int index = 0; index < helpers.length; index++) {
+            helpers[index] = definition.method("helper$expression$" + index, int.class).access(PRIVATE, STATIC, SYNTHETIC);
+        }
+        helpers[0].body().ret(invokeStatic(helpers[96]));
+        for (int index = 1; index < helpers.length; index++) {
+            helpers[index].body().ret(constantInt(index));
+        }
+        definition.method("evaluate", int.class).access(PUBLIC, STATIC).body().ret(invokeStatic(helpers[0]));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        ClassModel model = definition.build();
+        CompiledUnit unit = compileSharded(
+                ClassCompiler.forTarget(definer.compilationTarget()),
+                definer.compilationTarget(),
+                model,
+                helpers);
+        assertThat(unit.types()).containsExactly(type);
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(96);
+    }
+
     private static BytecodeExpression largeConstantExpression(int initialValue)
     {
         BytecodeExpression expression = constantInt(initialValue);

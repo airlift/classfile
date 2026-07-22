@@ -15,6 +15,7 @@ package io.airlift.classfile;
 
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
+import java.lang.constant.MethodTypeDesc;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -34,6 +35,13 @@ import static java.util.Objects.requireNonNull;
 
 final class StatementPlanner
 {
+    // Model estimates are deliberately architecture-independent and are normally larger than
+    // emitted bytecode. Keep enough headroom for bound runtime data and structured control flow,
+    // whose emitted instructions are comparatively expensive, so helpers remain below the JIT
+    // target selected by CompilationPolicy.
+    private static final int ESTIMATE_TO_CODE_BUDGET_RATIO = 2;
+    private static final int MAX_CONTINUATION_DEPTH = 256;
+
     private StatementPlanner() {}
 
     static Result plan(ClassModel definition, CompilationPolicy policy, Set<String> expressionHelpers, boolean hiddenClass)
@@ -41,8 +49,9 @@ final class StatementPlanner
         requireNonNull(expressionHelpers, "expressionHelpers is null");
         Planner planner = new Planner(
                 definition.type(),
-                Math.max(64, policy.targetMethodCodeLimit() * 4),
+                Math.max(64, policy.targetMethodCodeLimit() * ESTIMATE_TO_CODE_BUDGET_RATIO),
                 policy.targetMethodCodeLimit(),
+                Math.max(1, policy.hardMethodCodeLimit() * 9 / 10),
                 hiddenClass,
                 expressionHelpers,
                 definition.methods().stream().map(MethodDefinition.Model::name).collect(Collectors.toSet()));
@@ -76,6 +85,7 @@ final class StatementPlanner
         private final ClassDesc owner;
         private final int regionBudget;
         private final int methodBudget;
+        private final int continuationHardEstimateBudget;
         private final boolean hiddenClass;
         private final Set<String> expressionHelpers;
         private final ArrayList<MethodDefinition.Model> helpers = new ArrayList<>();
@@ -83,11 +93,19 @@ final class StatementPlanner
         private final Set<String> usedMethodNames;
         private int nextHelper;
 
-        private Planner(ClassDesc owner, int regionBudget, int methodBudget, boolean hiddenClass, Set<String> expressionHelpers, Set<String> usedMethodNames)
+        private Planner(
+                ClassDesc owner,
+                int regionBudget,
+                int methodBudget,
+                int continuationHardEstimateBudget,
+                boolean hiddenClass,
+                Set<String> expressionHelpers,
+                Set<String> usedMethodNames)
         {
             this.owner = owner;
             this.regionBudget = regionBudget;
             this.methodBudget = methodBudget;
+            this.continuationHardEstimateBudget = continuationHardEstimateBudget;
             this.hiddenClass = hiddenClass;
             this.expressionHelpers = Set.copyOf(expressionHelpers);
             this.usedMethodNames = new LinkedHashSet<>(usedMethodNames);
@@ -111,8 +129,15 @@ final class StatementPlanner
         private CodeBlock extract(MethodDefinition.Model method)
         {
             List<Statement> source = method.body().statements();
+            Optional<ContinuationExtraction> trailingContinuation = extractTrailingContinuation(method, source);
+            if (trailingContinuation.isPresent()) {
+                ContinuationExtraction extraction = trailingContinuation.orElseThrow();
+                ArrayList<Statement> rewritten = new ArrayList<>(source.subList(0, extraction.start()));
+                rewritten.add(extraction.invocation());
+                source = List.copyOf(rewritten);
+            }
             ArrayList<Statement> result = new ArrayList<>();
-            boolean changed = false;
+            boolean changed = trailingContinuation.isPresent();
             for (int index = 0; index < source.size(); ) {
                 if (isEarlyFalseReturn(source.get(index))) {
                     int end = index;
@@ -194,6 +219,183 @@ final class StatementPlanner
                 index = end;
             }
             return changed ? method.body().withStatements(result) : method.body();
+        }
+
+        private Optional<ContinuationExtraction> extractTrailingContinuation(MethodDefinition.Model method, List<Statement> source)
+        {
+            if (source.size() < 3) {
+                return Optional.empty();
+            }
+            Optional<BytecodeExpression> returnValue = returnValue(source.getLast());
+            if (returnValue.isEmpty() || !ExpressionPlanner.canRewriteValue(returnValue.orElseThrow())) {
+                return Optional.empty();
+            }
+
+            int start = source.size() - 1;
+            while (start > 0 && source.get(start - 1) instanceof CodeBlock block && isExtractableBlock(block)) {
+                start--;
+            }
+            if (source.size() - start < 3) {
+                return Optional.empty();
+            }
+            List<CodeBlock> blocks = source.subList(start, source.size() - 1).stream()
+                    .map(CodeBlock.class::cast)
+                    .toList();
+
+            LinkedHashSet<Variable> declarations = new LinkedHashSet<>();
+            blocks.forEach(block -> collectDeclarations(block, declarations));
+            LinkedHashSet<Variable> writes = new LinkedHashSet<>();
+            blocks.forEach(block -> collectWrittenVariables(block, writes));
+            writes.removeAll(declarations);
+            if (writes.size() < 2 || writes.stream().anyMatch(variable -> !hasInitializer(method.body(), variable))) {
+                return Optional.empty();
+            }
+
+            LinkedHashSet<LocalValue> locals = new LinkedHashSet<>();
+            blocks.forEach(block -> locals.addAll(ExpressionPlanner.locals(block)));
+            locals.addAll(ExpressionPlanner.locals(returnValue.orElseThrow()));
+            locals.removeAll(declarations);
+            Optional<Variable> receiver = hiddenReceiver(method, locals);
+            if (hasUnsupportedOwnerLocal(locals, receiver)) {
+                return Optional.empty();
+            }
+            int parameterSlots = locals.stream().mapToInt(local -> ExpressionPlanner.slotSize(local.type())).sum();
+            if (parameterSlots > 255) {
+                return Optional.empty();
+            }
+
+            List<List<CodeBlock>> regions = partitionContinuationBlocks(blocks, regionBudget);
+            if (regions.size() > MAX_CONTINUATION_DEPTH) {
+                if (regionBudget >= continuationHardEstimateBudget) {
+                    throw continuationDepthException(method, regions.size());
+                }
+                List<List<CodeBlock>> coarsestRegions = partitionContinuationBlocks(blocks, continuationHardEstimateBudget);
+                if (coarsestRegions.size() > MAX_CONTINUATION_DEPTH ||
+                        coarsestRegions.stream().anyMatch(region -> estimate(region) > continuationHardEstimateBudget)) {
+                    throw continuationDepthException(method, regions.size());
+                }
+
+                int low = regionBudget + 1;
+                int high = continuationHardEstimateBudget;
+                while (low < high) {
+                    int budget = low + (high - low) / 2;
+                    if (partitionContinuationBlocks(blocks, budget).size() <= MAX_CONTINUATION_DEPTH) {
+                        high = budget;
+                    }
+                    else {
+                        low = budget + 1;
+                    }
+                }
+                regions = partitionContinuationBlocks(blocks, low);
+            }
+            if (regions.size() < 2) {
+                return Optional.empty();
+            }
+
+            Continuation next = null;
+            for (int index = regions.size() - 1; index >= 0; index--) {
+                List<CodeBlock> region = regions.get(index);
+                String methodName = helperName(method, "continuation");
+                ArrayList<Parameter> parameters = new ArrayList<>(locals.size());
+                IdentityHashMap<LocalValue, BytecodeExpression> replacements = new IdentityHashMap<>();
+                LinkedHashMap<String, Integer> parameterNames = new LinkedHashMap<>();
+                for (LocalValue local : locals) {
+                    if (isReceiver(local, receiver)) {
+                        continue;
+                    }
+                    String base = sanitize(local.name().equals("this") ? "receiver" : local.name());
+                    int occurrence = parameterNames.merge(base, 1, Integer::sum);
+                    Parameter parameter = Parameter.arg(occurrence == 1 ? base : base + occurrence, local.type());
+                    parameters.add(parameter);
+                    replacements.put(local, parameter);
+                }
+
+                MethodDefinition helper = new MethodDefinition(owner, methodName, method.returnType(), parameters);
+                if (receiver.isPresent()) {
+                    helper.access(PRIVATE, SYNTHETIC);
+                    replacements.put(receiver.orElseThrow(), helper.thisVariable());
+                }
+                else {
+                    helper.access(PRIVATE, STATIC, SYNTHETIC);
+                }
+                helper.comment("trailing continuation extracted from " + method.name());
+
+                LinkedHashSet<Variable> regionWrites = new LinkedHashSet<>();
+                region.forEach(block -> collectWrittenVariables(block, regionWrites));
+                regionWrites.retainAll(writes);
+                LinkedHashMap<String, Integer> localNames = new LinkedHashMap<>();
+                for (Variable variable : regionWrites) {
+                    String base = sanitize(variable.name()) + "State";
+                    int occurrence = localNames.merge(base, 1, Integer::sum);
+                    Variable helperVariable = helper.body().declare(
+                            occurrence == 1 ? base : base + occurrence,
+                            replacements.get(variable));
+                    replacements.put(variable, helperVariable);
+                }
+                for (CodeBlock block : region) {
+                    helper.body().append(ExpressionPlanner.rewrite(block, local -> replacements.getOrDefault(local, local)));
+                }
+
+                if (next == null) {
+                    helper.body().ret(ExpressionPlanner.rewrite(returnValue.orElseThrow(), replacements::get));
+                }
+                else {
+                    Continuation target = next;
+                    BytecodeExpression[] arguments = locals.stream()
+                            .filter(local -> !isReceiver(local, receiver))
+                            .map(local -> replacements.getOrDefault(local, local))
+                            .toArray(BytecodeExpression[]::new);
+                    BytecodeExpression call;
+                    if (receiver.isPresent()) {
+                        call = helper.thisVariable().invokeSpecial(owner, target.name(), target.methodType(), arguments);
+                    }
+                    else {
+                        call = BytecodeExpressions.invokeStatic(owner, target.name(), target.methodType(), arguments);
+                    }
+                    helper.body().ret(call);
+                }
+                helpers.add(helper.build());
+                names.add(methodName);
+                next = new Continuation(methodName, helper.methodType());
+            }
+
+            BytecodeExpression[] arguments = helperArguments(locals, receiver);
+            Continuation first = requireNonNull(next, "next is null");
+            BytecodeExpression call = receiver
+                    .map(value -> value.invokeSpecial(owner, first.name(), first.methodType(), arguments))
+                    .orElseGet(() -> BytecodeExpressions.invokeStatic(owner, first.name(), first.methodType(), arguments));
+            return Optional.of(new ContinuationExtraction(start, new Statements.Expression(call.ret())));
+        }
+
+        private static List<List<CodeBlock>> partitionContinuationBlocks(List<CodeBlock> blocks, int budget)
+        {
+            ArrayList<List<CodeBlock>> regions = new ArrayList<>();
+            for (int index = 0; index < blocks.size(); ) {
+                int end = index;
+                int estimated = 0;
+                while (end < blocks.size()) {
+                    int candidateEstimate = ExpressionPlanner.estimate(blocks.get(end));
+                    if (end > index && (long) estimated + candidateEstimate > budget) {
+                        break;
+                    }
+                    estimated += candidateEstimate;
+                    end++;
+                }
+                regions.add(blocks.subList(index, end));
+                index = end;
+            }
+            return regions;
+        }
+
+        private static int estimate(List<CodeBlock> blocks)
+        {
+            return blocks.stream().mapToInt(ExpressionPlanner::estimate).sum();
+        }
+
+        private static CompilationException continuationDepthException(MethodDefinition.Model method, int desiredDepth)
+        {
+            return new CompilationException("The requested target for method %s%s would create %s continuation helpers, but the compiler limits generated continuation depth to %s and cannot coarsen the helpers within the hard method limit"
+                    .formatted(method.name(), method.methodType().descriptorString(), desiredDepth, MAX_CONTINUATION_DEPTH));
         }
 
         private Optional<Statement> extractConditions(MethodDefinition.Model method, List<Statement> region)
@@ -339,7 +541,12 @@ final class StatementPlanner
             LinkedHashSet<Variable> writes = new LinkedHashSet<>();
             region.forEach(block -> collectWrittenVariables(block, writes));
             writes.removeAll(declarations);
-            if (!writes.isEmpty()) {
+            if (writes.size() > 1) {
+                return Optional.empty();
+            }
+            Optional<Variable> output = writes.stream().findFirst();
+            if (output.filter(variable -> !hasInitializer(method.body(), variable)).isPresent() ||
+                    output.map(Variable::type).filter(this::referencesOwner).isPresent()) {
                 return Optional.empty();
             }
 
@@ -363,7 +570,7 @@ final class StatementPlanner
                 replacements.put(local, parameter);
             }
 
-            MethodDefinition helper = new MethodDefinition(owner, methodName, CD_void, parameters);
+            MethodDefinition helper = new MethodDefinition(owner, methodName, output.map(Variable::type).orElse(CD_void), parameters);
             if (receiver.isPresent()) {
                 helper.access(PRIVATE, SYNTHETIC);
                 replacements.put(receiver.orElseThrow(), helper.thisVariable());
@@ -372,10 +579,19 @@ final class StatementPlanner
                 helper.access(PRIVATE, STATIC, SYNTHETIC);
             }
             helper.comment("blocks extracted from " + method.name());
+            output.ifPresent(variable -> {
+                Variable helperOutput = helper.body().declare("result", replacements.get(variable));
+                replacements.put(variable, helperOutput);
+            });
             for (CodeBlock block : region) {
                 helper.body().append(ExpressionPlanner.rewrite(block, local -> replacements.getOrDefault(local, local)));
             }
-            helper.body().ret();
+            if (output.isEmpty()) {
+                helper.body().ret();
+            }
+            else {
+                helper.body().ret(replacements.get(output.orElseThrow()));
+            }
             helpers.add(helper.build());
             names.add(methodName);
 
@@ -383,7 +599,7 @@ final class StatementPlanner
             BytecodeExpression call = receiver
                     .map(value -> value.invokeSpecial(owner, methodName, helper.methodType(), arguments))
                     .orElseGet(() -> BytecodeExpressions.invokeStatic(owner, methodName, helper.methodType(), arguments));
-            return Optional.of(new Statements.Expression(call));
+            return Optional.of(new Statements.Expression(output.map(variable -> variable.set(call)).orElse(call)));
         }
 
         private Optional<Variable> hiddenReceiver(MethodDefinition.Model method, Set<? extends LocalValue> locals)
@@ -429,6 +645,10 @@ final class StatementPlanner
             while (!usedMethodNames.add(name));
             return name;
         }
+
+        private record Continuation(String name, MethodTypeDesc methodType) {}
+
+        private record ContinuationExtraction(int start, Statement invocation) {}
     }
 
     private static MethodDefinition.Model copy(MethodDefinition.Model method, CodeBlock body)
@@ -596,6 +816,16 @@ final class StatementPlanner
                 Boolean.FALSE.equals(constant.value());
     }
 
+    private static Optional<BytecodeExpression> returnValue(Statement statement)
+    {
+        if (!(statement instanceof Statements.Expression(CoreExpression core)) ||
+                !(core.node() instanceof ExpressionNode.Adapter adapter) ||
+                !adapter.keyword().equals("return")) {
+            return Optional.empty();
+        }
+        return Optional.of(adapter.value());
+    }
+
     private static Set<Variable> writtenVariables(Statement statement)
     {
         LinkedHashSet<Variable> writes = new LinkedHashSet<>();
@@ -650,6 +880,15 @@ final class StatementPlanner
             return false;
         }
         return ExpressionPlanner.locals(set.value()).stream().noneMatch(local -> same(local, output));
+    }
+
+    private static boolean hasInitializer(CodeBlock body, Variable variable)
+    {
+        return body.statements().stream()
+                .filter(Statements.InitializedDeclaration.class::isInstance)
+                .map(Statements.InitializedDeclaration.class::cast)
+                .map(Statements.InitializedDeclaration::variable)
+                .anyMatch(declaration -> same(declaration, variable));
     }
 
     private static void collectWrittenVariables(Statement statement, Set<Variable> writes)
