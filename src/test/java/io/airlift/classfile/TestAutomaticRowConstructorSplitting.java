@@ -86,7 +86,7 @@ public class TestAutomaticRowConstructorSplitting
     }
 
     @Test
-    void testBlockWritingCapturedLocalIsNotMoved()
+    void testBlockWritingOneCapturedLocalIsMoved()
             throws Throwable
     {
         MethodHandles.Lookup hostLookup = MethodHandles.lookup();
@@ -110,7 +110,7 @@ public class TestAutomaticRowConstructorSplitting
         assertThat(unit.report().classes().stream()
                 .flatMap(classInfo -> classInfo.methods().stream())
                 .map(CompilationReport.MethodInfo::name))
-                .noneMatch(name -> name.startsWith("count$blocks$"));
+                .anyMatch(name -> name.startsWith("count$blocks$"));
 
         DefinedUnit defined = HiddenClassDefiner.builder(hostLookup).build().defineUnit(unit);
         MethodHandle countMethod = defined.primaryLookup().orElseThrow()

@@ -22,12 +22,16 @@ import java.lang.invoke.MethodType;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.BytecodeExpressions.constantFalse;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
 import static io.airlift.classfile.BytecodeExpressions.constantTrue;
+import static io.airlift.classfile.BytecodeExpressions.inlineIf;
 import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
 import static io.airlift.classfile.BytecodeExpressions.newArray;
+import static io.airlift.classfile.CodeBlock.block;
+import static io.airlift.classfile.CodeBlock.blockBuilder;
 import static io.airlift.classfile.Parameter.arg;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PUBLIC;
@@ -79,6 +83,70 @@ public class TestAutomaticFlatHashSplitting
         MethodHandle hash = hidden.primaryLookup().orElseThrow()
                 .findStatic(hidden.primaryClass(), "hash", MethodType.methodType(long.class, int[].class));
         assertThat((long) hash.invokeExact(values)).isEqualTo(expectedHash(values));
+    }
+
+    @Test
+    void testBoundHandleScopedHelpersStayWithinJitTarget()
+            throws Throwable
+    {
+        int fieldCount = 512;
+        ClassDefinition definition = ClassDefinition.define(generatedType("FlatHashIdentical", fieldCount)).access(PUBLIC, FINAL);
+        Parameter left = arg("left", byte[].class);
+        Parameter blocks = arg("blocks", ValueBlock[].class);
+        Parameter position = arg("position", int.class);
+        MethodDefinition method = definition.method("valueIdentical", boolean.class, left, blocks, position).access(PUBLIC, STATIC);
+        Variable state = method.body().declare("state", constantInt(0));
+        MethodHandle identical = MethodHandles.lookup().findStatic(
+                TestAutomaticFlatHashSplitting.class,
+                "identical",
+                MethodType.methodType(boolean.class, byte[].class, int.class, ValueBlock.class, int.class));
+        for (int field = 0; field < fieldCount; field++) {
+            CodeBlock.Builder compare = blockBuilder();
+            Variable block = compare.declare("block", blocks.getElement(field));
+            Variable leftIsNull = compare.declare("leftIsNull", left.getElement(field).cast(int.class).equal(constantInt(NULL_VALUE)));
+            Variable rightIsNull = compare.declare("rightIsNull", block.invoke("isNull", boolean.class, position));
+            compare.append(IfStatement.builder()
+                    .condition(leftIsNull)
+                    .then(block(state.set(inlineIf(rightIsNull, state, constantInt(-1)))))
+                    .otherwise(block(IfStatement.builder()
+                            .condition(rightIsNull)
+                            .then(block(state.set(constantInt(-1))))
+                            .otherwise(block(state.set(inlineIf(
+                                    boundMethodHandle(identical).invoke(left, constantInt(field), block, position),
+                                    state,
+                                    constantInt(-1)))))
+                            .build()))
+                    .build());
+            method.body().append(block(IfStatement.builder()
+                    .condition(state.greaterThanOrEqual(constantInt(0)))
+                    .then(compare.build())
+                    .build()));
+        }
+        method.body().ret(state.greaterThanOrEqual(constantInt(0)));
+
+        CompilationPolicy policy = new CompilationPolicy(65_535, 7_200, 35, 325, true);
+        MethodHandles.Lookup hostLookup = MethodHandles.lookup();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(hostLookup))
+                .policy(policy)
+                .compileUnit(definition.build());
+
+        assertThat(unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .filter(methodInfo -> methodInfo.name().startsWith("valueIdentical$blocks$")))
+                .isNotEmpty()
+                .allSatisfy(methodInfo -> assertThat(methodInfo.codeBytes()).isLessThanOrEqualTo(policy.targetMethodCodeLimit()));
+
+        DefinedUnit hidden = HiddenClassDefiner.builder(hostLookup).build().defineUnit(unit);
+        MethodHandle valueIdentical = hidden.primaryLookup().orElseThrow().findStatic(
+                hidden.primaryClass(),
+                "valueIdentical",
+                MethodType.methodType(boolean.class, byte[].class, ValueBlock[].class, int.class));
+        byte[] leftValues = new byte[fieldCount];
+        ValueBlock[] rightValues = new ValueBlock[fieldCount];
+        Arrays.fill(rightValues, new IntValueBlock(0));
+        assertThat((boolean) valueIdentical.invokeExact(leftValues, rightValues, 0)).isTrue();
+        rightValues[fieldCount - 1] = new IntValueBlock(1);
+        assertThat((boolean) valueIdentical.invokeExact(leftValues, rightValues, 0)).isFalse();
     }
 
     private static ClassModel flatHashModel(int fieldCount)
@@ -311,6 +379,34 @@ public class TestAutomaticFlatHashSplitting
     public static long combineHash(long hash, int value)
     {
         return (hash * 31) + (value == NULL_VALUE ? 0x9E37_79B9L : value * 37L);
+    }
+
+    public static boolean identical(byte[] left, int offset, ValueBlock right, int position)
+    {
+        return left[offset] == right.getInt(position);
+    }
+
+    public interface ValueBlock
+    {
+        boolean isNull(int position);
+
+        int getInt(int position);
+    }
+
+    private record IntValueBlock(int value)
+            implements ValueBlock
+    {
+        @Override
+        public boolean isNull(int position)
+        {
+            return false;
+        }
+
+        @Override
+        public int getInt(int position)
+        {
+            return value;
+        }
     }
 
     private static long expectedHash(int[] values)
