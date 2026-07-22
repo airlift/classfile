@@ -72,8 +72,9 @@ rather than symbolic generated-class references.
 2. Split eligible top-level statement sequences into static helper methods.
 3. Move generated helpers into companion classes when helper count or constant usage
    puts pressure on the primary class.
-4. Emit every physical class, measure the exact classfiles, enforce the configured
-   hard method limit, and produce a `CompilationReport`.
+4. Emit every physical class, measure the exact classfiles, optionally re-emit a
+   hidden-lambda owner to preserve a JIT boundary, enforce the configured hard method
+   limit, and produce a `CompilationReport`.
 
 The first two steps use conservative size estimates to choose candidates. The final
 step parses the emitted classfiles with the JDK Class-File API and records exact code,
@@ -167,6 +168,21 @@ and experimentation. They do not currently cause additional splitting. Splitting
 large generated methods into hundreds of tiny methods merely to meet an inline limit
 would generally increase call overhead without guaranteeing that HotSpot will inline
 them.
+
+### Hidden Lambda JIT Boundaries
+
+Hidden-safe LambdaMetafactory linkage adds an inlineable adapter between the consumer
+and a same-owner implementation method. Small implementation methods must remain
+inlineable so captured lambda instances can be scalar-replaced, but allowing a larger
+target to inline through the adapter can inflate the consumer's C2 graph.
+
+The compiler therefore emits and parses the class once to measure exact implementation
+method sizes. A non-constructor target in the upper half of the range between
+`MaxInlineSize` and `FreqInlineSize` receives harmless load/pop padding that moves it
+one byte beyond `FreqInlineSize`; the class is then emitted, parsed, measured, and
+verified again. Smaller targets and targets already above `FreqInlineSize` are not
+re-emitted. This is a JIT-boundary adjustment, not statement splitting, and the final
+measured classfile is the one recorded in `CompilationReport`.
 
 The generated hidden type itself cannot be the functional interface returned by a
 same-owner LambdaMetafactory site. Such a site is rejected during compilation; define
