@@ -27,7 +27,8 @@ import static java.util.Objects.requireNonNull;
 /// @param hardMethodCodeLimit maximum permitted emitted `Code` attribute size
 /// @param targetMethodCodeLimit optimization target above which splitting is attempted
 /// @param maxInlineSize ordinary HotSpot inlining-size guidance
-/// @param frequentInlineSize hot-call-site HotSpot inlining-size guidance
+/// @param frequentInlineSize hot-call-site HotSpot inlining-size guidance, also used to identify
+///         invocation-dense scoped statement sequences whose complexity can exhaust the optimizer
 /// @param jitThresholdFallback whether the target limit uses a fallback because the JVM threshold
 ///         is not observable
 public record CompilationPolicy(
