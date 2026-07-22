@@ -24,6 +24,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -34,7 +35,7 @@ final class LinkageValidator
 {
     private LinkageValidator() {}
 
-    static void validate(ClassModel definition, LinkageContext linkage, Optional<Object> classData)
+    static Set<ClassDesc> validate(ClassModel definition, LinkageContext linkage, Optional<Object> classData)
     {
         requireNonNull(definition, "definition is null");
         requireNonNull(linkage, "linkage is null");
@@ -60,6 +61,7 @@ final class LinkageValidator
                 context.statement(method.body(), methodLocation + " body");
             }
         }
+        return Set.copyOf(context.classDataTypes);
     }
 
     private static final class Context
@@ -67,6 +69,7 @@ final class LinkageValidator
         private final ClassModel definition;
         private final LinkageContext linkage;
         private final Optional<Object> classData;
+        private final Set<ClassDesc> classDataTypes = new LinkedHashSet<>();
         private final Set<SyntheticExpression> activeSyntheticExpressions = Collections.newSetFromMap(new IdentityHashMap<>());
 
         private Context(ClassModel definition, LinkageContext linkage, Optional<Object> classData)
@@ -248,6 +251,7 @@ final class LinkageValidator
                 case ExpressionNode.DynamicConstant dynamicConstant -> {
                     dynamicConstant(dynamicConstant.constant(), location);
                     if (dynamicConstant.constant().bootstrapMethod().equals(BootstrapDescriptors.classDataConstant())) {
+                        classDataTypes.add(dynamicConstant.type());
                         classData.ifPresent(value -> linkage.requireInstance(value, dynamicConstant.type(), definition, location + " class data"));
                     }
                 }

@@ -29,7 +29,7 @@ import static java.lang.constant.DirectMethodHandleDesc.Kind.STATIC;
 
 final class BootstrapDescriptors
 {
-    private static final ClassDesc RUNTIME_BOOTSTRAPS = ClassDesc.of(RuntimeBootstraps.class.getName());
+    private static final ClassDesc RUNTIME_BOOTSTRAPS = ClassDesc.of("io.airlift.classfile.RuntimeBootstraps");
     private static final DirectMethodHandleDesc BINDING_CONSTANT = MethodHandleDesc.ofMethod(
             STATIC,
             RUNTIME_BOOTSTRAPS,
@@ -45,6 +45,21 @@ final class BootstrapDescriptors
             RUNTIME_BOOTSTRAPS,
             "classDataConstant",
             MethodTypeDesc.of(CD_Object, CD_MethodHandles_Lookup, CD_String, CD_Class));
+    private static final DirectMethodHandleDesc HIDDEN_CLASS_LAMBDA_METAFACTORY = MethodHandleDesc.ofMethod(
+            STATIC,
+            RUNTIME_BOOTSTRAPS,
+            "hiddenClassLambdaMetafactory",
+            MethodTypeDesc.of(
+                    CD_CallSite,
+                    CD_MethodHandles_Lookup,
+                    CD_String,
+                    CD_MethodType,
+                    CD_String,
+                    CD_int,
+                    CD_String,
+                    CD_String,
+                    CD_String,
+                    CD_String));
     private static final DirectMethodHandleDesc RECORD_OBJECT_METHOD = MethodHandleDesc.ofMethod(
             STATIC,
             RUNTIME_BOOTSTRAPS,
@@ -73,6 +88,11 @@ final class BootstrapDescriptors
     static DirectMethodHandleDesc classDataConstant()
     {
         return CLASS_DATA_CONSTANT;
+    }
+
+    static DirectMethodHandleDesc hiddenClassLambdaMetafactory()
+    {
+        return HIDDEN_CLASS_LAMBDA_METAFACTORY;
     }
 
     static DirectMethodHandleDesc recordObjectMethod()

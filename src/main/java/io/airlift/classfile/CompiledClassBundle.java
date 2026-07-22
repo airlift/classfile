@@ -14,6 +14,7 @@
 package io.airlift.classfile;
 
 import java.lang.constant.ClassDesc;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -26,18 +27,27 @@ import static java.util.Objects.requireNonNull;
 /// runtime bindings owned by the compiler.
 public final class CompiledClassBundle
 {
+    private final CompilationTarget target;
     private final Map<ClassDesc, byte[]> classfiles;
     private final RuntimeData runtimeData;
+    private final Set<ClassDesc> classDataTypes;
 
-    CompiledClassBundle(Map<ClassDesc, byte[]> classfiles, RuntimeData runtimeData)
+    CompiledClassBundle(CompilationTarget target, Map<ClassDesc, byte[]> classfiles, RuntimeData runtimeData, Set<ClassDesc> classDataTypes)
     {
+        this.target = requireNonNull(target, "target is null");
         requireNonNull(classfiles, "classfiles is null");
         LinkedHashMap<ClassDesc, byte[]> copies = new LinkedHashMap<>();
         classfiles.forEach((type, classfile) -> copies.put(
                 requireNonNull(type, "type is null"),
                 requireNonNull(classfile, "classfile is null").clone()));
-        this.classfiles = Map.copyOf(copies);
+        this.classfiles = Collections.unmodifiableMap(copies);
         this.runtimeData = requireNonNull(runtimeData, "runtimeData is null");
+        this.classDataTypes = Set.copyOf(requireNonNull(classDataTypes, "classDataTypes is null"));
+    }
+
+    public CompilationTarget target()
+    {
+        return target;
     }
 
     public Set<ClassDesc> types()
@@ -58,11 +68,17 @@ public final class CompiledClassBundle
     {
         LinkedHashMap<ClassDesc, byte[]> copies = new LinkedHashMap<>();
         classfiles.forEach((type, classfile) -> copies.put(type, classfile.clone()));
-        return Map.copyOf(copies);
+        return Collections.unmodifiableMap(copies);
     }
 
     RuntimeData runtimeData()
     {
         return runtimeData;
+    }
+
+    /// Validates the effective runtime data that will be installed for this bundle.
+    void validateRuntimeData(RuntimeData runtimeData)
+    {
+        RuntimeDataRequirements.validate(target, classfiles.keySet().iterator().next(), classfiles.keySet(), classDataTypes, runtimeData);
     }
 }

@@ -16,6 +16,7 @@ package io.airlift.classfile;
 import java.util.List;
 import java.util.Optional;
 
+import static io.airlift.classfile.Identity.same;
 import static java.util.Objects.requireNonNull;
 
 /// Caller-supplied class data used when defining compiled classes.
@@ -59,8 +60,57 @@ public final class RuntimeData
         return bindings.get(index);
     }
 
+    static RuntimeData merge(RuntimeData configured, RuntimeData compiled)
+    {
+        requireNonNull(configured, "configured is null");
+        requireNonNull(compiled, "compiled is null");
+        if (isEmpty(configured) || compatible(configured, compiled)) {
+            return compiled;
+        }
+        if (isEmpty(compiled)) {
+            return configured;
+        }
+        if (compiled.bindings().isEmpty() && sameClassData(configured.classData(), compiled.classData())) {
+            return configured;
+        }
+        if (configured.bindings().isEmpty() && sameClassData(configured.classData(), compiled.classData())) {
+            return compiled;
+        }
+        if (configured.bindings().isEmpty() && compiled.classData().isEmpty()) {
+            return new RuntimeData(configured.classData(), compiled.bindings());
+        }
+        throw new IllegalArgumentException("Runtime data is incompatible");
+    }
+
+    static boolean compatible(RuntimeData first, RuntimeData second)
+    {
+        requireNonNull(first, "first is null");
+        requireNonNull(second, "second is null");
+        if (!sameClassData(first.classData(), second.classData()) || first.bindings().size() != second.bindings().size()) {
+            return false;
+        }
+        for (int index = 0; index < first.bindings().size(); index++) {
+            if (!same(first.bindings().get(index), second.bindings().get(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static boolean sameClassData(Optional<Object> first, Optional<Object> second)
+    {
+        requireNonNull(first, "first is null");
+        requireNonNull(second, "second is null");
+        return first.isPresent() == second.isPresent() && (first.isEmpty() || same(first.orElseThrow(), second.orElseThrow()));
+    }
+
     boolean isEmpty()
     {
         return classData.isEmpty() && bindings.isEmpty();
+    }
+
+    private static boolean isEmpty(RuntimeData runtimeData)
+    {
+        return runtimeData.isEmpty();
     }
 }
