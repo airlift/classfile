@@ -15,7 +15,7 @@ package io.airlift.classfile;
 
 import java.util.ArrayDeque;
 import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.List;
 
 import static java.util.Objects.requireNonNull;
 
@@ -23,69 +23,188 @@ final class StructuredDepth
 {
     static final int MAX_NESTING = 512;
 
+    private static final int MAX_RECURSION = 128;
+    private static final ArrayDeque<Node> NO_PENDING = new ArrayDeque<>(0);
+
     private StructuredDepth() {}
 
     static void validate(Statement statement)
     {
-        ArrayDeque<Node> pending = new ArrayDeque<>();
-        Map<SyntheticExpression, Integer> expandedDepth = new IdentityHashMap<>();
-        pending.push(new Node(requireNonNull(statement, "statement is null"), 0));
-        while (!pending.isEmpty()) {
-            Node node = pending.pop();
-            if (node.depth() > MAX_NESTING) {
+        new Validator().validate(requireNonNull(statement, "statement is null"), 0, 0, false, NO_PENDING);
+    }
+
+    private static final class Validator
+    {
+        private IdentityHashMap<SyntheticExpression, Integer> expandedDepth;
+
+        private void validate(Object value, int depth, int recursion, boolean queued, ArrayDeque<Node> pending)
+        {
+            if (depth > MAX_NESTING) {
                 throw new IllegalArgumentException("Structured statement nesting exceeds the supported limit of " + MAX_NESTING);
             }
-            switch (node.value()) {
+            if (recursion == MAX_RECURSION) {
+                validateIterative(value, depth);
+                return;
+            }
+
+            switch (value) {
                 case LocalValue _ -> {}
-                case CoreExpression core -> core.node().children().forEach(child -> pending.push(new Node(child, node.depth())));
-                case SyntheticExpression synthetic -> {
-                    Integer previousDepth = expandedDepth.put(synthetic, node.depth());
-                    if (previousDepth == null || node.depth() > previousDepth) {
-                        ExpressionPlan expansion = requireNonNull(synthetic.expansion(ExpansionContext.INSTANCE), "synthetic expansion is null");
-                        pending.push(new Node(expansion.value(), node.depth()));
-                        pending.push(new Node(expansion.setup(), node.depth() + 1));
+                case CoreExpression core -> {
+                    List<BytecodeExpression> children = core.node().children();
+                    if (queued) {
+                        children.forEach(child -> visit(child, depth, recursion + 1, true, pending));
+                    }
+                    else {
+                        for (int index = children.size() - 1; index >= 0; index--) {
+                            visit(children.get(index), depth, recursion + 1, false, pending);
+                        }
                     }
                 }
-                case Statements.Expression expression -> pending.push(new Node(expression.expression(), node.depth()));
-                case Statements.InitializedDeclaration declaration -> pending.push(new Node(declaration.initializer(), node.depth()));
-                case CodeBlock block -> block.statements().forEach(item -> pending.push(new Node(item, node.depth() + 1)));
-                case IfStatement value -> {
-                    pending.push(new Node(value.condition(), node.depth()));
-                    pending.push(new Node(value.ifTrue(), node.depth() + 1));
-                    pending.push(new Node(value.ifFalse(), node.depth() + 1));
+                case SyntheticExpression synthetic -> {
+                    if (shouldExpand(synthetic, depth)) {
+                        ExpressionPlan expansion = requireNonNull(synthetic.expansion(ExpansionContext.INSTANCE), "synthetic expansion is null");
+                        if (queued) {
+                            visit(expansion.value(), depth, recursion + 1, true, pending);
+                            visit(expansion.setup(), depth + 1, recursion + 1, true, pending);
+                        }
+                        else {
+                            visit(expansion.setup(), depth + 1, recursion + 1, false, pending);
+                            visit(expansion.value(), depth, recursion + 1, false, pending);
+                        }
+                    }
                 }
-                case ForLoop value -> {
-                    pending.push(new Node(value.initializer(), node.depth() + 1));
-                    pending.push(new Node(value.condition(), node.depth()));
-                    pending.push(new Node(value.update(), node.depth() + 1));
-                    pending.push(new Node(value.body(), node.depth() + 1));
+                case Statements.Expression expression -> visit(expression.expression(), depth, recursion + 1, queued, pending);
+                case Statements.InitializedDeclaration declaration -> visit(declaration.initializer(), depth, recursion + 1, queued, pending);
+                case CodeBlock block -> {
+                    if (queued) {
+                        block.statements().forEach(child -> visit(child, depth + 1, recursion + 1, true, pending));
+                    }
+                    else {
+                        for (int index = block.statements().size() - 1; index >= 0; index--) {
+                            visit(block.statements().get(index), depth + 1, recursion + 1, false, pending);
+                        }
+                    }
                 }
-                case WhileLoop value -> {
-                    pending.push(new Node(value.condition(), node.depth()));
-                    pending.push(new Node(value.body(), node.depth() + 1));
+                case IfStatement statement -> {
+                    if (queued) {
+                        visit(statement.condition(), depth, recursion + 1, true, pending);
+                        visit(statement.ifTrue(), depth + 1, recursion + 1, true, pending);
+                        visit(statement.ifFalse(), depth + 1, recursion + 1, true, pending);
+                    }
+                    else {
+                        visit(statement.ifFalse(), depth + 1, recursion + 1, false, pending);
+                        visit(statement.ifTrue(), depth + 1, recursion + 1, false, pending);
+                        visit(statement.condition(), depth, recursion + 1, false, pending);
+                    }
                 }
-                case DoWhileLoop value -> {
-                    pending.push(new Node(value.body(), node.depth() + 1));
-                    pending.push(new Node(value.condition(), node.depth()));
+                case ForLoop statement -> {
+                    if (queued) {
+                        visit(statement.initializer(), depth + 1, recursion + 1, true, pending);
+                        visit(statement.condition(), depth, recursion + 1, true, pending);
+                        visit(statement.update(), depth + 1, recursion + 1, true, pending);
+                        visit(statement.body(), depth + 1, recursion + 1, true, pending);
+                    }
+                    else {
+                        visit(statement.body(), depth + 1, recursion + 1, false, pending);
+                        visit(statement.update(), depth + 1, recursion + 1, false, pending);
+                        visit(statement.condition(), depth, recursion + 1, false, pending);
+                        visit(statement.initializer(), depth + 1, recursion + 1, false, pending);
+                    }
                 }
-                case SwitchStatement value -> {
-                    pending.push(new Node(value.expression(), node.depth()));
-                    value.cases().forEach(item -> pending.push(new Node(item.body(), node.depth() + 1)));
-                    pending.push(new Node(value.defaultCase(), node.depth() + 1));
+                case WhileLoop statement -> {
+                    if (queued) {
+                        visit(statement.condition(), depth, recursion + 1, true, pending);
+                        visit(statement.body(), depth + 1, recursion + 1, true, pending);
+                    }
+                    else {
+                        visit(statement.body(), depth + 1, recursion + 1, false, pending);
+                        visit(statement.condition(), depth, recursion + 1, false, pending);
+                    }
                 }
-                case TryCatch value -> {
-                    pending.push(new Node(value.tryBlock(), node.depth() + 1));
-                    value.catches().forEach(item -> pending.push(new Node(item.body(), node.depth() + 1)));
-                    value.finallyBlock().ifPresent(item -> pending.push(new Node(item, node.depth() + 1)));
+                case DoWhileLoop statement -> {
+                    if (queued) {
+                        visit(statement.body(), depth + 1, recursion + 1, true, pending);
+                        visit(statement.condition(), depth, recursion + 1, true, pending);
+                    }
+                    else {
+                        visit(statement.condition(), depth, recursion + 1, false, pending);
+                        visit(statement.body(), depth + 1, recursion + 1, false, pending);
+                    }
                 }
-                case Statements.ConstructorInvocation value -> value.arguments().forEach(argument -> pending.push(new Node(argument, node.depth())));
+                case SwitchStatement statement -> {
+                    if (queued) {
+                        visit(statement.expression(), depth, recursion + 1, true, pending);
+                        statement.cases().forEach(switchCase -> visit(switchCase.body(), depth + 1, recursion + 1, true, pending));
+                        visit(statement.defaultCase(), depth + 1, recursion + 1, true, pending);
+                    }
+                    else {
+                        visit(statement.defaultCase(), depth + 1, recursion + 1, false, pending);
+                        for (int index = statement.cases().size() - 1; index >= 0; index--) {
+                            visit(statement.cases().get(index).body(), depth + 1, recursion + 1, false, pending);
+                        }
+                        visit(statement.expression(), depth, recursion + 1, false, pending);
+                    }
+                }
+                case TryCatch statement -> {
+                    if (queued) {
+                        visit(statement.tryBlock(), depth + 1, recursion + 1, true, pending);
+                        statement.catches().forEach(catchClause -> visit(catchClause.body(), depth + 1, recursion + 1, true, pending));
+                        statement.finallyBlock().ifPresent(finallyBlock -> visit(finallyBlock, depth + 1, recursion + 1, true, pending));
+                    }
+                    else {
+                        statement.finallyBlock().ifPresent(finallyBlock -> visit(finallyBlock, depth + 1, recursion + 1, false, pending));
+                        for (int index = statement.catches().size() - 1; index >= 0; index--) {
+                            visit(statement.catches().get(index).body(), depth + 1, recursion + 1, false, pending);
+                        }
+                        visit(statement.tryBlock(), depth + 1, recursion + 1, false, pending);
+                    }
+                }
+                case Statements.ConstructorInvocation invocation -> {
+                    if (queued) {
+                        invocation.arguments().forEach(argument -> visit(argument, depth, recursion + 1, true, pending));
+                    }
+                    else {
+                        for (int index = invocation.arguments().size() - 1; index >= 0; index--) {
+                            visit(invocation.arguments().get(index), depth, recursion + 1, false, pending);
+                        }
+                    }
+                }
                 case Statements.Declaration _,
                      Statements.Comment _,
                      Statements.Jump _,
                      Statements.LabelBinding _,
                      LoopJump _ -> {}
-                default -> throw new AssertionError("Unknown structured value: " + node.value());
+                default -> throw new AssertionError("Unknown structured value: " + value);
             }
+        }
+
+        private void validateIterative(Object value, int depth)
+        {
+            ArrayDeque<Node> pending = new ArrayDeque<>();
+            pending.push(new Node(value, depth));
+            while (!pending.isEmpty()) {
+                Node node = pending.pop();
+                validate(node.value(), node.depth(), 0, true, pending);
+            }
+        }
+
+        private void visit(Object value, int depth, int recursion, boolean queued, ArrayDeque<Node> pending)
+        {
+            if (queued) {
+                pending.push(new Node(value, depth));
+            }
+            else {
+                validate(value, depth, recursion, false, pending);
+            }
+        }
+
+        private boolean shouldExpand(SyntheticExpression synthetic, int depth)
+        {
+            if (expandedDepth == null) {
+                expandedDepth = new IdentityHashMap<>();
+            }
+            Integer previousDepth = expandedDepth.put(synthetic, depth);
+            return previousDepth == null || depth > previousDepth;
         }
     }
 

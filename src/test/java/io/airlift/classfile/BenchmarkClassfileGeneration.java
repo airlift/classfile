@@ -27,15 +27,21 @@ import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Warmup;
 
 import java.lang.constant.ClassDesc;
+import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
+import static io.airlift.classfile.BytecodeExpressions.constantBoolean;
+import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PRIVATE;
 import static java.lang.reflect.AccessFlag.PUBLIC;
+import static java.lang.reflect.AccessFlag.STATIC;
 
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @BenchmarkMode(Mode.AverageTime)
@@ -44,6 +50,9 @@ import static java.lang.reflect.AccessFlag.PUBLIC;
 @Measurement(iterations = 6, time = 1)
 public class BenchmarkClassfileGeneration
 {
+    private static final MethodHandle LONG_IDENTITY = MethodHandles.identity(long.class);
+    private static final MethodHandle LONGS_EQUAL = findStatic("longsEqual", MethodType.methodType(boolean.class, long.class, long.class));
+
     @Benchmark
     public ClassCompiler createCompiler(CompilerData data)
     {
@@ -61,6 +70,14 @@ public class BenchmarkClassfileGeneration
     public CompiledClass compileClassReusingCompiler(BenchmarkData data)
     {
         return data.compiler.compileClass(data.model);
+    }
+
+    @Benchmark
+    public void validateStructuredDepth(BenchmarkData data)
+    {
+        for (MethodDefinition.Model method : data.model.methods()) {
+            StructuredDepth.validate(method.body());
+        }
     }
 
     @Benchmark
@@ -100,7 +117,7 @@ public class BenchmarkClassfileGeneration
     @State(Scope.Thread)
     public static class BenchmarkData
     {
-        @Param({"STATE_1", "STATE_5", "STATE_64", "STATE_512"})
+        @Param({"STATE_1", "STATE_5", "STATE_64", "STATE_512", "WIDE_NESTED_50", "DEEP_EXPRESSION_512"})
         private Shape shape;
 
         private MethodHandles.Lookup lookup;
@@ -118,7 +135,11 @@ public class BenchmarkClassfileGeneration
             definer = HiddenClassDefiner.builder(lookup).build();
             target = definer.compilationTarget();
             compiler = ClassCompiler.forTarget(target);
-            model = stateModel(shape.fieldCount());
+            model = switch (shape) {
+                case STATE_1, STATE_5, STATE_64, STATE_512 -> stateModel(shape.fieldCount());
+                case WIDE_NESTED_50 -> wideNestedModel(50);
+                case DEEP_EXPRESSION_512 -> deepExpressionModel(512);
+            };
             compiledClass = compiler.compileClass(model);
             classfile = compiledClass.classfile();
         }
@@ -129,7 +150,9 @@ public class BenchmarkClassfileGeneration
         STATE_1(1),
         STATE_5(5),
         STATE_64(64),
-        STATE_512(512);
+        STATE_512(512),
+        WIDE_NESTED_50(0),
+        DEEP_EXPRESSION_512(0);
 
         private final int fieldCount;
 
@@ -181,6 +204,59 @@ public class BenchmarkClassfileGeneration
         estimatedSize.body().append(size.ret());
 
         return definition.build();
+    }
+
+    private static ClassModel wideNestedModel(int fieldCount)
+    {
+        ClassDefinition definition = ClassDefinition.define(ClassDesc.of(BenchmarkClassfileGeneration.class.getPackageName() + ".GeneratedBenchmarkWideNested"))
+                .access(PUBLIC, FINAL);
+        definition.defaultConstructor().access(PUBLIC);
+
+        Parameter left = Parameter.arg("left", long[].class);
+        Parameter right = Parameter.arg("right", long[].class);
+        MethodDefinition method = definition.method("valueIdentical", boolean.class, left, right).access(PUBLIC, STATIC);
+        for (int fieldIndex = 0; fieldIndex < fieldCount; fieldIndex++) {
+            CodeBlock.Builder field = CodeBlock.blockBuilder();
+            Variable leftValue = field.declare("left" + fieldIndex, boundMethodHandle(LONG_IDENTITY).invoke(left.getElement(constantInt(fieldIndex))));
+            Variable rightValue = field.declare("right" + fieldIndex, boundMethodHandle(LONG_IDENTITY).invoke(right.getElement(constantInt(fieldIndex))));
+            field.append(IfStatement.builder()
+                    .condition(boundMethodHandle(LONGS_EQUAL).invoke(leftValue, rightValue).not())
+                    .then(constantBoolean(false).ret())
+                    .build());
+            method.body().append(field.build());
+        }
+        method.body().ret(constantBoolean(true));
+        return definition.build();
+    }
+
+    private static ClassModel deepExpressionModel(int expressionDepth)
+    {
+        ClassDefinition definition = ClassDefinition.define(ClassDesc.of(BenchmarkClassfileGeneration.class.getPackageName() + ".GeneratedBenchmarkDeepExpression"))
+                .access(PUBLIC, FINAL);
+        definition.defaultConstructor().access(PUBLIC);
+
+        BytecodeExpression expression = constantLong(0);
+        for (int index = 0; index < expressionDepth; index++) {
+            expression = expression.add(constantLong(1));
+        }
+        definition.method("value", long.class).access(PUBLIC, STATIC).body().ret(expression);
+        return definition.build();
+    }
+
+    @SuppressWarnings("UnusedMethod") // Resolved reflectively by LONGS_EQUAL.
+    private static boolean longsEqual(long left, long right)
+    {
+        return left == right;
+    }
+
+    private static MethodHandle findStatic(String name, MethodType type)
+    {
+        try {
+            return MethodHandles.lookup().findStatic(BenchmarkClassfileGeneration.class, name, type);
+        }
+        catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
     }
 
     public static void main(String[] args)
