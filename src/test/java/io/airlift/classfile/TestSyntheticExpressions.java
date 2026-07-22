@@ -13,20 +13,30 @@
  */
 package io.airlift.classfile;
 
+import io.airlift.classfile.tool.ClassFileDiagnostics;
 import org.junit.jupiter.api.Test;
 
 import java.lang.constant.ClassDesc;
+import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
+import static io.airlift.classfile.BytecodeExpressions.constantFalse;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
+import static io.airlift.classfile.BytecodeExpressions.constantNull;
+import static io.airlift.classfile.BytecodeExpressions.constantTrue;
+import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
 import static io.airlift.classfile.BytecodeExpressions.newArray;
 import static io.airlift.classfile.ClassfileTestUtils.defineHidden;
 import static java.lang.constant.ConstantDescs.CD_Object;
 import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.lang.constant.ConstantDescs.CD_int;
+import static java.lang.constant.ConstantDescs.CD_long;
+import static java.lang.invoke.MethodType.methodType;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PUBLIC;
 import static java.lang.reflect.AccessFlag.STATIC;
@@ -36,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestSyntheticExpressions
 {
     private static final AtomicLong NEXT_CLASS_ID = new AtomicLong();
+    private static final MethodHandle ADD = methodHandle("add", methodType(long.class, long.class, long.class));
 
     @Test
     void testStructuredExpressionIsFluentAndReusable()
@@ -184,6 +195,79 @@ class TestSyntheticExpressions
         assertThat(generated.getMethod("conditions", int.class).invoke(null, 1)).isEqualTo(true);
     }
 
+    @Test
+    void testBoundHandleDenseSyntheticSetupsUseCompactCallSites()
+            throws Exception
+    {
+        ClassModel compactModel = denseBoundHandleSetup(48);
+        int compactEstimate = ExpressionPlanner.estimate(compactModel.methods().getFirst().body());
+        int targetMethodCodeLimit = (compactEstimate * 2 + 4) / 5;
+        assertThat(compactEstimate).isGreaterThan(targetMethodCodeLimit * 2);
+        assertThat(compactEstimate).isLessThanOrEqualTo(targetMethodCodeLimit * 3);
+
+        CompilationPolicy policy = CompilationPolicy.builder()
+                .targetMethodCodeLimit(targetMethodCodeLimit)
+                .build();
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(compactModel);
+        List<CompilationReport.MethodInfo> methods = unit.report().classes().getFirst().methods();
+        CompilationReport.MethodInfo valueMethod = methods.getFirst();
+        assertThat(valueMethod.name()).isEqualTo("value");
+        assertThat(methods).hasSize(1);
+        assertThat(valueMethod.codeBytes()).isLessThan(targetMethodCodeLimit);
+        assertThat(ClassFileDiagnostics.disassemble(unit.classfile(unit.primaryType())))
+                .contains("opcode: INVOKEDYNAMIC")
+                .doesNotContain("owner: java/lang/invoke/MethodHandle, method name: invokeExact");
+
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("value").invoke(null)).isEqualTo(48L);
+
+        ClassModel wideModel = denseBoundHandleSetup(64);
+        assertThat(ExpressionPlanner.estimate(wideModel.methods().getFirst().body())).isGreaterThan(targetMethodCodeLimit * 3);
+        CompiledUnit wideUnit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup))
+                .policy(policy)
+                .compileUnit(wideModel);
+        assertThat(wideUnit.report().classes().getFirst().methods())
+                .anySatisfy(method -> assertThat(method.name()).startsWith("value$continuation$"))
+                .allSatisfy(method -> assertThat(method.codeBytes()).isLessThan(targetMethodCodeLimit));
+        Class<?> wideGenerated = HiddenClassDefiner.builder(lookup).build().defineUnit(wideUnit).primaryClass();
+        assertThat(wideGenerated.getMethod("value").invoke(null)).isEqualTo(64L);
+    }
+
+    private static ClassModel denseBoundHandleSetup(int statements)
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("BoundHandleDenseSetup")).access(PUBLIC, FINAL);
+        MethodDefinition method = definition.method("value", Long.class).access(PUBLIC, STATIC);
+        Variable wasNull = method.body().declare("wasNull", constantFalse());
+        Variable value = method.body().declare("value", invokeStatic(Long.class, "valueOf", Long.class, constantLong(0)));
+        for (int index = 0; index < statements; index++) {
+            method.body().append(CodeBlock.block(value.set(new BoxedAdd(value, wasNull))));
+        }
+        method.body().ret(value);
+        return definition.build();
+    }
+
+    @Test
+    void testSyntheticResultForwardingPreservesExceptionalAssignment()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("ExceptionalForwarding")).access(PUBLIC, FINAL);
+        MethodDefinition method = definition.method("value", int.class).access(PUBLIC, STATIC);
+        Variable value = method.body().declare("value", constantInt(7));
+        method.body().append(TryCatch.builder()
+                .tryBlock(value.set(new AssignThenFail()))
+                .catching(IllegalStateException.class, "ignored", (_, _) -> {})
+                .build());
+        method.body().ret(value);
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        Class<?> generated = HiddenClassDefiner.builder(lookup).build().defineUnit(
+                ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileUnit(definition.build())).primaryClass();
+        assertThat(generated.getMethod("value").invoke(null)).isEqualTo(7);
+    }
+
     private static ClassDesc generatedClass(String suffix)
     {
         return ClassDesc.of(TestSyntheticExpressions.class.getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
@@ -234,6 +318,137 @@ class TestSyntheticExpressions
         {
             return "offset(" + input + ")";
         }
+    }
+
+    private record BoxedAdd(BytecodeExpression input, Variable wasNull)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return ClassDesc.of(Long.class.getName());
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            setup.append(wasNull.set(constantFalse()));
+            Variable result = setup.declare("expressionResult", new NullPropagatingAdd(input, wasNull));
+            return new ExpressionPlan(setup.build(), new BoxIfNecessary(result, wasNull));
+        }
+    }
+
+    private static final class AssignThenFail
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_int;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable result = setup.declare(CD_int, "result");
+            setup.append(result.set(constantInt(1)));
+            setup.append(invokeStatic(TestSyntheticExpressions.class, "fail", int.class));
+            return new ExpressionPlan(setup.build(), result);
+        }
+    }
+
+    private record NullPropagatingAdd(BytecodeExpression input, Variable wasNull)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_long;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable result = setup.declare(CD_long, "result");
+            Variable argument = setup.declare("argument", new UnboxIfNecessary(input, wasNull));
+            setup.append(IfStatement.builder()
+                    .condition(wasNull)
+                    .then(CodeBlock.block(result.set(constantLong(0))))
+                    .otherwise(CodeBlock.block(result.set(boundMethodHandle(ADD).invoke(argument, constantLong(1)))))
+                    .build());
+            return new ExpressionPlan(setup.build(), result);
+        }
+    }
+
+    private record UnboxIfNecessary(BytecodeExpression input, Variable wasNull)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return CD_long;
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable boxed = setup.declare("boxedResult", input);
+            Variable result = setup.declare(CD_long, "unboxedResult");
+            setup.append(IfStatement.builder()
+                    .condition(boxed.isNull())
+                    .then(CodeBlock.block(wasNull.set(constantTrue()), result.set(constantLong(0))))
+                    .otherwise(CodeBlock.block(result.set(boxed.invoke("longValue", long.class))))
+                    .build());
+            return new ExpressionPlan(setup.build(), result);
+        }
+    }
+
+    private record BoxIfNecessary(BytecodeExpression input, Variable wasNull)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return ClassDesc.of(Long.class.getName());
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            Variable result = setup.declare(Long.class, "boxed");
+            setup.append(IfStatement.builder()
+                    .condition(wasNull)
+                    .then(CodeBlock.block(result.set(constantNull(Long.class))))
+                    .otherwise(CodeBlock.block(result.set(invokeStatic(Long.class, "valueOf", Long.class, input))))
+                    .build());
+            return new ExpressionPlan(setup.build(), result);
+        }
+    }
+
+    private static MethodHandle methodHandle(String name, MethodType type)
+    {
+        try {
+            return MethodHandles.lookup().findStatic(TestSyntheticExpressions.class, name, type);
+        }
+        catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    @SuppressWarnings("UnusedMethod")
+    private static long add(long left, long right)
+    {
+        return left + right;
+    }
+
+    public static int fail()
+    {
+        throw new IllegalStateException("expected");
     }
 
     private static final class SetupValue
