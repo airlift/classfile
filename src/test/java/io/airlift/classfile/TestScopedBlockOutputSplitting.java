@@ -159,6 +159,102 @@ class TestScopedBlockOutputSplitting
     }
 
     @Test
+    void testScopedBlocksWithOneLiveOutputAndOverwrittenScratchSplit()
+            throws ReflectiveOperationException
+    {
+        ClassDefinition definition = ClassDefinition.define(TestScopedBlockOutputSplitting.class).access(PUBLIC, FINAL);
+        MethodDefinition evaluate = definition.method("evaluate", int.class).access(PUBLIC, STATIC);
+        Variable result = evaluate.body().declare("result", constantInt(0));
+        Variable scratch = evaluate.body().declare("scratch", constantInt(0));
+        for (int index = 0; index < 100; index++) {
+            evaluate.body().append(block(
+                    scratch.set(constantInt(index)),
+                    result.set(result.add(scratch))));
+        }
+        evaluate.body().append(scratch.set(constantInt(7)));
+        evaluate.body().ret(result.add(scratch));
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .policy(SPLITTING_POLICY)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .filter(method -> method.name().contains("$blocks$")))
+                .isNotEmpty()
+                .allSatisfy(method -> assertThat(method.type().returnType()).isEqualTo(CD_int));
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(4_957);
+    }
+
+    @Test
+    void testLoopBreakBeforeOverwriteKeepsOutputLive()
+            throws ReflectiveOperationException
+    {
+        ClassDefinition definition = ClassDefinition.define(TestScopedBlockOutputSplitting.class).access(PUBLIC, FINAL);
+        MethodDefinition evaluate = definition.method("evaluate", int.class).access(PUBLIC, STATIC);
+        Variable result = evaluate.body().declare("result", constantInt(0));
+        for (int index = 0; index < 100; index++) {
+            evaluate.body().append(block(result.set(constantInt(index))));
+        }
+        DoWhileLoop.Builder loop = DoWhileLoop.builder();
+        evaluate.body().append(loop
+                .body(block(
+                        IfStatement.builder()
+                                .condition(BytecodeExpressions.constantTrue())
+                                .then(loop.breakLoop())
+                                .build(),
+                        result.set(constantInt(999))))
+                .condition(BytecodeExpressions.constantFalse())
+                .build());
+        evaluate.body().ret(result);
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .policy(SPLITTING_POLICY)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .filter(method -> method.name().contains("$blocks$")))
+                .isNotEmpty()
+                .anySatisfy(method -> assertThat(method.type().returnType()).isEqualTo(CD_int));
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(99);
+    }
+
+    @Test
+    void testJumpBeforeOverwriteKeepsOutputLive()
+            throws ReflectiveOperationException
+    {
+        ClassDefinition definition = ClassDefinition.define(TestScopedBlockOutputSplitting.class).access(PUBLIC, FINAL);
+        MethodDefinition evaluate = definition.method("evaluate", int.class).access(PUBLIC, STATIC);
+        Variable result = evaluate.body().declare("result", constantInt(0));
+        for (int index = 0; index < 100; index++) {
+            evaluate.body().append(block(result.set(constantInt(index))));
+        }
+        CodeLabel afterOverwrite = evaluate.body().label("afterOverwrite");
+        evaluate.body().jump(afterOverwrite);
+        evaluate.body().append(result.set(constantInt(999)));
+        evaluate.body().mark(afterOverwrite);
+        evaluate.body().ret(result);
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .policy(SPLITTING_POLICY)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .filter(method -> method.name().contains("$blocks$")))
+                .isNotEmpty()
+                .anySatisfy(method -> assertThat(method.type().returnType()).isEqualTo(CD_int));
+
+        Class<?> generated = definer.defineUnit(unit).primaryClass();
+        assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(99);
+    }
+
+    @Test
     void testNonTrailingScopedBlocksWithMultipleOutputsAreNotExtracted()
     {
         ClassDefinition definition = ClassDefinition.define(TestScopedBlockOutputSplitting.class).access(PUBLIC, FINAL);

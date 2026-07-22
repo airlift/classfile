@@ -272,8 +272,18 @@ physical helper descriptor and is independent of lexical local-slot reuse.
 ## Statement Splitting
 
 Statement planning runs after expression splitting. It considers an ordinary method
-only when the estimated method body exceeds `targetMethodCodeLimit`. Constructors,
-class initializers, and generated expression helpers are skipped.
+only when the estimated method body exceeds the statement-planning budget:
+
+```text
+max(64, targetMethodCodeLimit * 3)
+```
+
+The model estimate is intentionally conservative and normally larger than emitted
+bytecode. The whole-method trigger uses three times the target; once splitting is
+necessary, helper grouping uses the tighter two-times-target budget. The additional
+trigger headroom avoids splitting an ordinary emitted method that is already below
+the target, while the tighter grouping budget keeps generated helpers below it.
+Constructors, class initializers, and generated expression helpers are skipped.
 
 The planner scans the top-level statements in the method body. It recognizes
 sequential expression regions, repeated early-false returns, and eligible nested
@@ -324,11 +334,15 @@ completes normally. An eligible block may contain expressions, declarations,
 comments, nested blocks, and `if/else` statements composed from the same forms.
 
 Locals declared by the moved blocks remain ordinary scoped locals in the helper.
-References to parameters and outer locals become helper parameters. Direct assignment
-to a captured outer local prevents extraction because updating a helper parameter
-would not update the caller's local. Mutations visible through a captured reference,
-such as filling an array or invoking a mutating method, do not need a returned value
-and remain eligible.
+References to parameters and outer locals become helper parameters. A region may
+assign several initialized outer locals when at most one incoming value is read after
+the region before being overwritten. The helper returns that one live result to the
+caller. Other written locals become helper-local scratch values because the caller
+overwrites them before any read. Conditional writes and control transfers are treated
+conservatively; a value is dead only when every path overwrites it before a read.
+Regions that assign an uninitialized outer local or produce more than one live local
+remain in place. Mutations visible through a captured reference, such as filling an
+array or invoking a mutating method, do not need a returned value and remain eligible.
 
 This form supports generators that construct one independently scoped block per
 field. Authors can retain field-local declarations and conditional setup without

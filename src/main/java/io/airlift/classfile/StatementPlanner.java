@@ -36,10 +36,11 @@ import static java.util.Objects.requireNonNull;
 final class StatementPlanner
 {
     // Model estimates are deliberately architecture-independent and are normally larger than
-    // emitted bytecode. Keep enough headroom for bound runtime data and structured control flow,
-    // whose emitted instructions are comparatively expensive, so helpers remain below the JIT
-    // target selected by CompilationPolicy.
-    private static final int ESTIMATE_TO_CODE_BUDGET_RATIO = 2;
+    // emitted bytecode. Give the whole method more trigger headroom so an ordinary method is not
+    // split prematurely, then use a tighter grouping budget so extracted helpers remain below the
+    // JIT target selected by CompilationPolicy.
+    private static final int METHOD_ESTIMATE_TO_CODE_BUDGET_RATIO = 3;
+    private static final int REGION_ESTIMATE_TO_CODE_BUDGET_RATIO = 2;
     private static final int MAX_CONTINUATION_DEPTH = 256;
 
     private StatementPlanner() {}
@@ -49,8 +50,8 @@ final class StatementPlanner
         requireNonNull(expressionHelpers, "expressionHelpers is null");
         Planner planner = new Planner(
                 definition.type(),
-                Math.max(64, policy.targetMethodCodeLimit() * ESTIMATE_TO_CODE_BUDGET_RATIO),
-                policy.targetMethodCodeLimit(),
+                Math.max(64, policy.targetMethodCodeLimit() * METHOD_ESTIMATE_TO_CODE_BUDGET_RATIO),
+                Math.max(64, policy.targetMethodCodeLimit() * REGION_ESTIMATE_TO_CODE_BUDGET_RATIO),
                 Math.max(1, policy.hardMethodCodeLimit() * 9 / 10),
                 hiddenClass,
                 expressionHelpers,
@@ -83,8 +84,8 @@ final class StatementPlanner
     private static final class Planner
     {
         private final ClassDesc owner;
-        private final int regionBudget;
         private final int methodBudget;
+        private final int regionBudget;
         private final int continuationHardEstimateBudget;
         private final boolean hiddenClass;
         private final Set<String> expressionHelpers;
@@ -95,16 +96,16 @@ final class StatementPlanner
 
         private Planner(
                 ClassDesc owner,
-                int regionBudget,
                 int methodBudget,
+                int regionBudget,
                 int continuationHardEstimateBudget,
                 boolean hiddenClass,
                 Set<String> expressionHelpers,
                 Set<String> usedMethodNames)
         {
             this.owner = owner;
-            this.regionBudget = regionBudget;
             this.methodBudget = methodBudget;
+            this.regionBudget = regionBudget;
             this.continuationHardEstimateBudget = continuationHardEstimateBudget;
             this.hiddenClass = hiddenClass;
             this.expressionHelpers = Set.copyOf(expressionHelpers);
@@ -113,20 +114,239 @@ final class StatementPlanner
 
         private MethodDefinition.Model method(MethodDefinition.Model method)
         {
+            return method(method, methodBudget);
+        }
+
+        private MethodDefinition.Model method(MethodDefinition.Model method, int triggerBudget)
+        {
             if (!method.hasBody() || method.isConstructor() || method.isClassInitializer() || expressionHelpers.contains(method.name())) {
                 return method;
             }
-            if (ExpressionPlanner.estimate(method.body()) <= methodBudget) {
+            if (ExpressionPlanner.estimate(method.body()) <= triggerBudget) {
                 return method;
             }
-            CodeBlock body = extract(method);
-            if (body == method.body()) {
-                return method;
+            CodeBlock plannedBody = planSyntheticSetups(method, method.body());
+            MethodDefinition.Model plannedMethod = same(plannedBody, method.body()) ? method : copy(method, plannedBody);
+            if (ExpressionPlanner.estimate(plannedBody) <= triggerBudget) {
+                return plannedMethod;
             }
-            return copy(method, body);
+            CodeBlock branchBody = extractBranches(plannedMethod, plannedBody, triggerBudget);
+            if (different(branchBody, plannedBody)) {
+                plannedMethod = copy(plannedMethod, branchBody);
+                if (ExpressionPlanner.estimate(branchBody) <= triggerBudget) {
+                    return plannedMethod;
+                }
+            }
+            CodeBlock body = extract(plannedMethod, List.of());
+            if (same(body, plannedMethod.body())) {
+                return plannedMethod;
+            }
+            return copy(plannedMethod, body);
         }
 
-        private CodeBlock extract(MethodDefinition.Model method)
+        private CodeBlock extractBranches(MethodDefinition.Model method, CodeBlock block, int triggerBudget)
+        {
+            if (ExpressionPlanner.estimate(block) <= triggerBudget) {
+                return block;
+            }
+
+            boolean changed = false;
+            ArrayList<Statement> statements = new ArrayList<>(block.statements().size());
+            for (Statement statement : block.statements()) {
+                Statement rewritten = extractBranches(method, statement, triggerBudget);
+                statements.add(rewritten);
+                changed |= different(rewritten, statement);
+            }
+            return changed ? block.withStatements(statements) : block;
+        }
+
+        private Statement extractBranches(MethodDefinition.Model method, Statement statement, int triggerBudget)
+        {
+            if (statement instanceof CodeBlock block) {
+                return extractBranches(method, block, triggerBudget);
+            }
+            if (!(statement instanceof IfStatement ifStatement) || ExpressionPlanner.estimate(ifStatement) <= triggerBudget) {
+                return statement;
+            }
+
+            CodeBlock ifTrue = extractBranch(method, ifStatement.ifTrue())
+                    .orElseGet(() -> extractBranches(method, ifStatement.ifTrue(), triggerBudget));
+            CodeBlock ifFalse = extractBranch(method, ifStatement.ifFalse())
+                    .orElseGet(() -> extractBranches(method, ifStatement.ifFalse(), triggerBudget));
+            if (same(ifTrue, ifStatement.ifTrue()) && same(ifFalse, ifStatement.ifFalse())) {
+                return statement;
+            }
+            return ifStatement.rewrite(ifStatement.condition(), ifTrue, ifFalse);
+        }
+
+        private Optional<CodeBlock> extractBranch(MethodDefinition.Model method, CodeBlock branch)
+        {
+            if (branch.isEmpty() || !isExtractableBranchBlock(branch)) {
+                return Optional.empty();
+            }
+
+            LinkedHashSet<Variable> declarations = new LinkedHashSet<>();
+            collectDeclarations(branch, declarations);
+            LinkedHashSet<Variable> writes = new LinkedHashSet<>();
+            collectWrittenVariables(branch, writes);
+            writes.removeAll(declarations);
+            if (!writes.isEmpty()) {
+                return Optional.empty();
+            }
+
+            LinkedHashSet<LocalValue> locals = new LinkedHashSet<>(ExpressionPlanner.locals(branch));
+            locals.removeAll(declarations);
+            Optional<Variable> receiver = hiddenReceiver(method, locals);
+            if (hasUnsupportedOwnerLocal(locals, receiver)) {
+                return Optional.empty();
+            }
+            int parameterSlots = locals.stream().mapToInt(local -> ExpressionPlanner.slotSize(local.type())).sum();
+            if (parameterSlots > 255) {
+                return Optional.empty();
+            }
+
+            String sourceName = method.name();
+            int generatedSuffix = sourceName.indexOf("$branches$");
+            if (generatedSuffix >= 0) {
+                sourceName = sourceName.substring(0, generatedSuffix);
+            }
+            String methodName = helperName(sourceName, "branches");
+            ArrayList<Parameter> parameters = new ArrayList<>(locals.size());
+            IdentityHashMap<LocalValue, BytecodeExpression> replacements = new IdentityHashMap<>();
+            LinkedHashMap<String, Integer> parameterNames = new LinkedHashMap<>();
+            for (LocalValue local : locals) {
+                if (isReceiver(local, receiver)) {
+                    continue;
+                }
+                String base = sanitize(local.name().equals("this") ? "receiver" : local.name());
+                int occurrence = parameterNames.merge(base, 1, Integer::sum);
+                Parameter parameter = Parameter.arg(occurrence == 1 ? base : base + occurrence, local.type());
+                parameters.add(parameter);
+                replacements.put(local, parameter);
+            }
+
+            MethodDefinition helper = new MethodDefinition(owner, methodName, CD_void, parameters);
+            if (receiver.isPresent()) {
+                helper.access(PRIVATE, SYNTHETIC);
+                replacements.put(receiver.orElseThrow(), helper.thisVariable());
+            }
+            else {
+                helper.access(PRIVATE, STATIC, SYNTHETIC);
+            }
+            helper.comment("structured branch extracted from " + method.name());
+            helper.body()
+                    .append(ExpressionPlanner.rewrite(branch, local -> replacements.getOrDefault(local, local)))
+                    .ret();
+            MethodDefinition.Model plannedHelper = method(helper.build(), regionBudget);
+            helpers.add(plannedHelper);
+            names.add(methodName);
+
+            BytecodeExpression[] arguments = helperArguments(locals, receiver);
+            BytecodeExpression call = receiver
+                    .map(value -> value.invokeSpecial(owner, methodName, helper.methodType(), arguments))
+                    .orElseGet(() -> BytecodeExpressions.invokeStatic(owner, methodName, helper.methodType(), arguments));
+            return Optional.of(CodeBlock.block(call));
+        }
+
+        private CodeBlock planSyntheticSetups(MethodDefinition.Model method, CodeBlock block)
+        {
+            boolean changed = false;
+            ArrayList<Statement> statements = new ArrayList<>(block.statements().size());
+            for (Statement statement : block.statements()) {
+                Statement rewritten = planSyntheticSetups(method, statement);
+                statements.add(rewritten);
+                changed |= different(rewritten, statement);
+            }
+            return changed ? block.withStatements(statements) : block;
+        }
+
+        private Statement planSyntheticSetups(MethodDefinition.Model method, Statement statement)
+        {
+            return switch (statement) {
+                case BytecodeExpression expression -> planSyntheticSetups(method, expression);
+                case Statements.Expression expression -> {
+                    BytecodeExpression rewritten = planSyntheticSetups(method, expression.expression());
+                    yield same(rewritten, expression.expression()) ? expression : new Statements.Expression(rewritten);
+                }
+                case Statements.InitializedDeclaration declaration -> {
+                    BytecodeExpression initializer = planSyntheticSetups(method, declaration.initializer());
+                    yield same(initializer, declaration.initializer()) ? declaration : new Statements.InitializedDeclaration(declaration.variable(), initializer);
+                }
+                case CodeBlock nested -> planSyntheticSetups(method, nested);
+                case DoWhileLoop loop -> loop.rewrite(
+                        planSyntheticSetups(method, loop.condition()),
+                        planSyntheticSetups(method, loop.body()));
+                case ForLoop loop -> loop.rewrite(
+                        planSyntheticSetups(method, loop.initializer()),
+                        planSyntheticSetups(method, loop.condition()),
+                        planSyntheticSetups(method, loop.update()),
+                        planSyntheticSetups(method, loop.body()));
+                case IfStatement ifStatement -> ifStatement.rewrite(
+                        planSyntheticSetups(method, ifStatement.condition()),
+                        planSyntheticSetups(method, ifStatement.ifTrue()),
+                        planSyntheticSetups(method, ifStatement.ifFalse()));
+                case SwitchStatement switchStatement -> switchStatement.rewrite(
+                        planSyntheticSetups(method, switchStatement.expression()),
+                        switchStatement.cases().stream()
+                                .map(caseValue -> new SwitchStatement.Case(caseValue.key(), planSyntheticSetups(method, caseValue.body())))
+                                .toList(),
+                        planSyntheticSetups(method, switchStatement.defaultCase()));
+                case TryCatch tryCatch -> tryCatch.rewrite(
+                        planSyntheticSetups(method, tryCatch.tryBlock()),
+                        tryCatch.catches().stream()
+                                .map(catchClause -> new TryCatch.CatchClause(
+                                        catchClause.exceptionType(),
+                                        catchClause.variable(),
+                                        planSyntheticSetups(method, catchClause.body())))
+                                .toList(),
+                        tryCatch.finallyBlock().map(finallyBlock -> planSyntheticSetups(method, finallyBlock)));
+                case WhileLoop loop -> loop.rewrite(
+                        planSyntheticSetups(method, loop.condition()),
+                        planSyntheticSetups(method, loop.body()));
+                case Statements.ConstructorInvocation invocation -> {
+                    List<BytecodeExpression> arguments = invocation.arguments().stream()
+                            .map(argument -> planSyntheticSetups(method, argument))
+                            .toList();
+                    yield arguments.equals(invocation.arguments()) ? invocation : new Statements.ConstructorInvocation(
+                            invocation.target(),
+                            invocation.declaredOwner(),
+                            invocation.constructorType(),
+                            arguments);
+                }
+                case LoopJump jump -> jump;
+                case Statements.Comment comment -> comment;
+                case Statements.Declaration declaration -> declaration;
+                case Statements.Jump jump -> jump;
+                case Statements.LabelBinding binding -> binding;
+            };
+        }
+
+        private BytecodeExpression planSyntheticSetups(MethodDefinition.Model method, BytecodeExpression expression)
+        {
+            return switch (expression) {
+                case LocalValue _ -> expression;
+                case SyntheticExpression synthetic -> {
+                    ExpressionPlan plan = requireNonNull(synthetic.expansion(ExpansionContext.INSTANCE), "synthetic expansion is null");
+                    CodeBlock setup = planSyntheticSetups(method, plan.setup());
+                    BytecodeExpression value = planSyntheticSetups(method, plan.value());
+                    if (ExpressionPlanner.estimate(setup) > methodBudget) {
+                        setup = extract(copy(method, setup), ExpressionPlanner.locals(value));
+                    }
+                    if (same(setup, plan.setup()) && same(value, plan.value())) {
+                        yield synthetic;
+                    }
+                    yield new PlannedSyntheticExpression(synthetic.type(), setup, value, synthetic.toString());
+                }
+                case CoreExpression core -> {
+                    ExpressionNode node = ExpressionPlanner.rewriteChildren(
+                            core.node(),
+                            child -> planSyntheticSetups(method, child));
+                    yield node.equals(core.node()) ? core : new CoreExpression(node);
+                }
+            };
+        }
+
+        private CodeBlock extract(MethodDefinition.Model method, List<? extends LocalValue> liveAfterBody)
         {
             List<Statement> source = method.body().statements();
             Optional<ContinuationExtraction> trailingContinuation = extractTrailingContinuation(method, source);
@@ -174,7 +394,7 @@ final class StatementPlanner
                     List<CodeBlock> region = source.subList(index, end).stream()
                             .map(CodeBlock.class::cast)
                             .toList();
-                    Optional<Statement> invocation = extractBlocks(method, region);
+                    Optional<Statement> invocation = extractBlocks(method, region, source.subList(end, source.size()), liveAfterBody);
                     if (invocation.isPresent()) {
                         result.add(invocation.orElseThrow());
                         changed = true;
@@ -525,7 +745,11 @@ final class StatementPlanner
             return Optional.of(new Statements.Expression(output.map(variable -> variable.set(call)).orElse(call)));
         }
 
-        private Optional<Statement> extractBlocks(MethodDefinition.Model method, List<CodeBlock> region)
+        private Optional<Statement> extractBlocks(
+                MethodDefinition.Model method,
+                List<CodeBlock> region,
+                List<Statement> liveAfter,
+                List<? extends LocalValue> liveAfterBody)
         {
             LinkedHashSet<Variable> declarations = new LinkedHashSet<>();
             region.forEach(block -> collectDeclarations(block, declarations));
@@ -541,12 +765,17 @@ final class StatementPlanner
             LinkedHashSet<Variable> writes = new LinkedHashSet<>();
             region.forEach(block -> collectWrittenVariables(block, writes));
             writes.removeAll(declarations);
-            if (writes.size() > 1) {
+            if (writes.stream().anyMatch(variable -> !hasInitializer(method.body(), variable))) {
                 return Optional.empty();
             }
-            Optional<Variable> output = writes.stream().findFirst();
-            if (output.filter(variable -> !hasInitializer(method.body(), variable)).isPresent() ||
-                    output.map(Variable::type).filter(this::referencesOwner).isPresent()) {
+            LinkedHashSet<Variable> liveWrites = writes.stream()
+                    .filter(variable -> isLiveAtStart(liveAfter, liveAfterBody, variable))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            if (liveWrites.size() > 1) {
+                return Optional.empty();
+            }
+            Optional<Variable> output = liveWrites.stream().findFirst();
+            if (output.map(Variable::type).filter(this::referencesOwner).isPresent()) {
                 return Optional.empty();
             }
 
@@ -583,6 +812,13 @@ final class StatementPlanner
                 Variable helperOutput = helper.body().declare("result", replacements.get(variable));
                 replacements.put(variable, helperOutput);
             });
+            for (Variable variable : writes) {
+                if (output.filter(value -> same(value, variable)).isPresent()) {
+                    continue;
+                }
+                Variable helperLocal = helper.body().declare(sanitize(variable.name()) + "State", replacements.get(variable));
+                replacements.put(variable, helperLocal);
+            }
             for (CodeBlock block : region) {
                 helper.body().append(ExpressionPlanner.rewrite(block, local -> replacements.getOrDefault(local, local)));
             }
@@ -638,9 +874,14 @@ final class StatementPlanner
 
         private String helperName(MethodDefinition.Model method, String category)
         {
+            return helperName(method.name(), category);
+        }
+
+        private String helperName(String sourceName, String category)
+        {
             String name;
             do {
-                name = sanitize(method.name()) + "$" + category + "$" + ++nextHelper;
+                name = sanitize(sourceName) + "$" + category + "$" + ++nextHelper;
             }
             while (!usedMethodNames.add(name));
             return name;
@@ -649,6 +890,31 @@ final class StatementPlanner
         private record Continuation(String name, MethodTypeDesc methodType) {}
 
         private record ContinuationExtraction(int start, Statement invocation) {}
+
+        private record PlannedSyntheticExpression(ClassDesc type, CodeBlock setup, BytecodeExpression value, String rendering)
+                implements SyntheticExpression
+        {
+            private PlannedSyntheticExpression
+            {
+                requireNonNull(type, "type is null");
+                requireNonNull(setup, "setup is null");
+                requireNonNull(value, "value is null");
+                requireNonNull(rendering, "rendering is null");
+            }
+
+            @Override
+            public ExpressionPlan expansion(ExpansionContext context)
+            {
+                requireNonNull(context, "context is null");
+                return new ExpressionPlan(setup, value);
+            }
+
+            @Override
+            public String toString()
+            {
+                return rendering;
+            }
+        }
     }
 
     private static MethodDefinition.Model copy(MethodDefinition.Model method, CodeBlock body)
@@ -714,6 +980,43 @@ final class StatementPlanner
     private static boolean isExtractableBlock(CodeBlock block)
     {
         return block.statements().stream().allMatch(StatementPlanner::isExtractableStatement);
+    }
+
+    private static boolean isExtractableBranchBlock(CodeBlock block)
+    {
+        return block.statements().stream().allMatch(StatementPlanner::isExtractableBranchStatement);
+    }
+
+    private static boolean isExtractableBranchStatement(Statement statement)
+    {
+        return switch (statement) {
+            case BytecodeExpression expression -> isExtractableBranchExpression(expression);
+            case Statements.Expression expression -> isExtractableBranchExpression(expression.expression());
+            case Statements.InitializedDeclaration declaration -> isExtractableBranchExpression(declaration.initializer());
+            case Statements.Declaration _,
+                 Statements.Comment _ -> true;
+            case CodeBlock block -> isExtractableBranchBlock(block);
+            case IfStatement value -> isExtractableBranchExpression(value.condition()) &&
+                    isExtractableBranchBlock(value.ifTrue()) &&
+                    isExtractableBranchBlock(value.ifFalse());
+            case DoWhileLoop _,
+                 ForLoop _,
+                 LoopJump _,
+                 SwitchStatement _,
+                 TryCatch _,
+                 WhileLoop _,
+                 Statements.ConstructorInvocation _,
+                 Statements.Jump _,
+                 Statements.LabelBinding _ -> false;
+        };
+    }
+
+    private static boolean isExtractableBranchExpression(BytecodeExpression expression)
+    {
+        if (expression instanceof CoreExpression core && core.node() instanceof ExpressionNode.Adapter adapter) {
+            return adapter.keyword().equals("throw") && isExtractableExpression(adapter.value());
+        }
+        return isExtractableExpression(expression);
     }
 
     private static boolean isExtractableStatement(Statement statement)
@@ -915,6 +1218,126 @@ final class StatementPlanner
                  Statements.Jump _,
                  Statements.LabelBinding _ -> {}
         }
+    }
+
+    private static boolean isLiveAtStart(
+            List<Statement> statements,
+            List<? extends LocalValue> liveAfterStatements,
+            Variable variable)
+    {
+        for (Statement statement : statements) {
+            switch (firstAccess(statement, variable)) {
+                case READ -> {
+                    return true;
+                }
+                case WRITE -> {
+                    return false;
+                }
+                case NONE -> {}
+            }
+        }
+        return liveAfterStatements.stream().anyMatch(local -> same(local, variable));
+    }
+
+    private static FirstAccess firstAccess(Statement statement, Variable variable)
+    {
+        return switch (statement) {
+            case BytecodeExpression expression -> firstAccess(expression, variable);
+            case Statements.Expression expression -> firstAccess(expression.expression(), variable);
+            case Statements.InitializedDeclaration declaration -> firstAccess(declaration.initializer(), variable);
+            case CodeBlock block -> firstAccessStatements(block.statements(), variable);
+            case IfStatement value -> {
+                FirstAccess condition = firstAccess(value.condition(), variable);
+                yield condition != FirstAccess.NONE ? condition : merge(
+                        firstAccess(value.ifTrue(), variable),
+                        firstAccess(value.ifFalse(), variable));
+            }
+            case DoWhileLoop value -> {
+                FirstAccess body = firstAccess(value.body(), variable);
+                yield body != FirstAccess.NONE ? body : firstAccess(value.condition(), variable);
+            }
+            case Statements.ConstructorInvocation value -> firstAccessExpressions(value.arguments(), variable);
+            case ForLoop _,
+                 SwitchStatement _,
+                 TryCatch _,
+                 WhileLoop _ -> ExpressionPlanner.locals(statement).stream().anyMatch(local -> same(local, variable)) ? FirstAccess.READ : FirstAccess.NONE;
+            case LoopJump _,
+                 Statements.Jump _ -> FirstAccess.READ;
+            case Statements.Comment _,
+                 Statements.Declaration _,
+                 Statements.LabelBinding _ -> FirstAccess.NONE;
+        };
+    }
+
+    private static FirstAccess firstAccess(BytecodeExpression expression, Variable variable)
+    {
+        return switch (expression) {
+            case LocalValue local -> same(local, variable) ? FirstAccess.READ : FirstAccess.NONE;
+            case SyntheticExpression synthetic -> {
+                ExpressionPlan plan = requireNonNull(synthetic.expansion(ExpansionContext.INSTANCE), "synthetic expansion is null");
+                FirstAccess setup = firstAccess(plan.setup(), variable);
+                yield setup != FirstAccess.NONE ? setup : firstAccess(plan.value(), variable);
+            }
+            case CoreExpression core -> switch (core.node()) {
+                case ExpressionNode.SetVariable value -> {
+                    FirstAccess initializer = firstAccess(value.value(), variable);
+                    yield initializer != FirstAccess.NONE ? initializer : same(value.variable(), variable) ? FirstAccess.WRITE : FirstAccess.NONE;
+                }
+                case ExpressionNode.Increment value -> same(value.variable(), variable) ? FirstAccess.READ : FirstAccess.NONE;
+                case ExpressionNode.Binary value -> {
+                    FirstAccess left = firstAccess(value.left(), variable);
+                    if (left != FirstAccess.NONE) {
+                        yield left;
+                    }
+                    FirstAccess right = firstAccess(value.right(), variable);
+                    if ((value.operator().equals("&&") || value.operator().equals("||")) && right == FirstAccess.WRITE) {
+                        yield FirstAccess.READ;
+                    }
+                    yield right;
+                }
+                case ExpressionNode.InlineIf value -> {
+                    FirstAccess condition = firstAccess(value.condition(), variable);
+                    yield condition != FirstAccess.NONE ? condition : merge(
+                            firstAccess(value.ifTrue(), variable),
+                            firstAccess(value.ifFalse(), variable));
+                }
+                default -> firstAccessExpressions(core.node().children(), variable);
+            };
+        };
+    }
+
+    private static FirstAccess firstAccessStatements(List<? extends Statement> statements, Variable variable)
+    {
+        for (Statement statement : statements) {
+            FirstAccess access = firstAccess(statement, variable);
+            if (access != FirstAccess.NONE) {
+                return access;
+            }
+        }
+        return FirstAccess.NONE;
+    }
+
+    private static FirstAccess firstAccessExpressions(List<? extends BytecodeExpression> expressions, Variable variable)
+    {
+        for (BytecodeExpression expression : expressions) {
+            FirstAccess access = firstAccess(expression, variable);
+            if (access != FirstAccess.NONE) {
+                return access;
+            }
+        }
+        return FirstAccess.NONE;
+    }
+
+    private static FirstAccess merge(FirstAccess left, FirstAccess right)
+    {
+        return left == right ? left : FirstAccess.READ;
+    }
+
+    private enum FirstAccess
+    {
+        NONE,
+        READ,
+        WRITE,
     }
 
     private static String sanitize(String name)

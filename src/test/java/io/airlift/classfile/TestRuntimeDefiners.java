@@ -411,8 +411,10 @@ class TestRuntimeDefiners
         HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
         try {
             List<WeakReference<Class<?>>> generatedClasses = new ArrayList<>();
-            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, false));
-            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, true));
+            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, false, false));
+            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, true, false));
+            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, false, true));
+            generatedClasses.addAll(linkedHiddenLambdaClasses(definer, true, true));
 
             long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
             while (generatedClasses.stream().anyMatch(reference -> reference.get() != null) && System.nanoTime() < deadline) {
@@ -426,7 +428,7 @@ class TestRuntimeDefiners
         }
     }
 
-    private static List<WeakReference<Class<?>>> linkedHiddenLambdaClasses(HiddenClassDefiner definer, boolean alternateMetafactory)
+    private static List<WeakReference<Class<?>>> linkedHiddenLambdaClasses(HiddenClassDefiner definer, boolean compileUnit, boolean alternateMetafactory)
             throws Exception
     {
         ClassDefinition classDefinition = ClassDefinition.define(generatedClass("CollectableHiddenLambda")).access(PUBLIC, FINAL);
@@ -473,7 +475,9 @@ class TestRuntimeDefiners
         classDefinition.constructor().access(PUBLIC).body().invokeSuperConstructor().ret();
 
         ClassModel model = classDefinition.build();
-        Class<?> generated = definer.defineClass(model).lookupClass();
+        Class<?> generated = compileUnit ?
+                definer.defineUnit(ClassCompiler.forTarget(definer.compilationTarget()).compileUnit(model)).primaryClass() :
+                definer.defineClass(model).lookupClass();
         Object instance = generated.getConstructor().newInstance();
         @SuppressWarnings("unchecked")
         Function<Long, Long> function = (Function<Long, Long>) generated.getMethod("get").invoke(instance);
