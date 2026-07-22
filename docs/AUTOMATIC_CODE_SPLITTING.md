@@ -286,7 +286,7 @@ the target, while the tighter grouping budget keeps generated helpers below it.
 Constructors, class initializers, and generated expression helpers are skipped.
 
 The planner scans the top-level statements in the method body. It recognizes
-sequential expression regions, repeated early-false returns, and eligible nested
+sequential expression regions, ordered early-boolean-return regions, and eligible nested
 `CodeBlock` regions. Other structured statements remain in place, although their
 nested expressions may already have been split by the expression pass.
 
@@ -315,17 +315,20 @@ visible to the caller.
 
 A candidate is not extracted when its captured locals exceed 255 parameter slots. A
 sequence that writes more than one distinct local is divided at the first safe
-boundary when possible; a remaining multi-output region stays in the original method.
+boundary when possible; a remaining non-trailing multi-output region stays in the
+original method.
 
 The planner groups estimated regions up to:
 
 ```text
-max(64, targetMethodCodeLimit * 4)
+max(64, targetMethodCodeLimit * 2)
 ```
 
 Expression splitting has already reduced large value trees before this grouping pass.
-The final emitted size, rather than the estimate, determines whether the hard limit
-is satisfied.
+The estimate-to-code ratio leaves headroom for structured control flow and bound
+runtime data, whose emitted instruction sequences can be larger than the logical
+model suggests. The final emitted size, rather than the estimate, determines whether
+the hard limit is satisfied.
 
 ### Scoped Block Regions
 
@@ -349,7 +352,34 @@ field. Authors can retain field-local declarations and conditional setup without
 manually grouping fields into helper methods. Loops, exception regions, switches,
 explicit jumps, and non-local exits terminate eligibility.
 
-### Repeated Early-False Returns
+### Trailing Multi-Output Continuations
+
+A trailing sequence of eligible scoped blocks may modify several initialized outer
+locals when the sequence ends in the method's value return. The planner divides the
+sequence into bounded helpers. Each helper receives the live values, updates local
+copies, and returns the result of invoking the next helper. The final helper evaluates
+the original return expression:
+
+```text
+method -> continuation3(hash, offset)
+              -> continuation2(hash, offset)
+                    -> continuation1(hash, offset)
+                          -> final result
+```
+
+This carries multiple values without a tuple, array, record, or other allocation.
+It preserves statement order and applies only to normally completing blocks directly
+before a value return. A non-trailing region, a void method, an uninitialized output,
+unsupported control flow, an owner-typed hidden-class local, or a descriptor above
+255 slots remains in the logical method.
+
+The compiler bounds the continuation chain to 256 helpers. If an unusually small
+target would create a deeper chain, adjacent regions are coarsened while retaining a
+conservative estimate below the hard method limit. Compilation fails with a planning
+diagnostic when no bounded allocation-free plan fits. This bounds compiler-added
+frames; it does not guarantee safety for every caller depth or Java stack size.
+
+### Repeated Early Boolean Returns
 
 Generated equality and filter methods commonly contain a sequence such as:
 
@@ -367,9 +397,18 @@ return true;
 ```
 
 Two or more consecutive top-level statements with exactly this shape can be moved to
-a boolean continuation helper. The helper evaluates conditions in order, returns
-`false` on the first match, and returns `true` when all checks pass. The caller retains
-one early-false test:
+a boolean continuation helper. The same extraction applies to the symmetric
+`if (condition) return true` form, and when each top-level statement is a scoped
+`CodeBlock` containing local declarations and one or more early returns of the same
+boolean value. This lets a generator retain single-evaluation locals around each
+comparison without authoring physical helper boundaries.
+
+Block-local declarations remain local to the helper. Parameters and read-only outer
+locals become helper parameters. A scoped early-return region is not extracted when it
+writes an outer local, mixes `true` and `false` returns, contains another return value,
+or contains unsupported control flow. The helper evaluates complete blocks in order,
+returns the authored boolean value on the first early return, and returns the opposite
+value when all checks pass. The caller retains one matching early-return test:
 
 ```java
 if (!identical$conditions$1(arguments)) {
@@ -377,14 +416,17 @@ if (!identical$conditions$1(arguments)) {
 }
 ```
 
-The transformation preserves condition order and early return behavior.
+The transformation preserves declaration scope, evaluation and exception order, and
+early return behavior.
 
 ### Structured Control Flow
 
-The statement planner does not extract an entire `if`, loop, `switch`, `try`, catch,
-or `finally` region. It also does not move explicit labels, jumps, `break`, or
-`continue`. These structures stay in the logical method, while expression planning
-can still reduce large conditions, selectors, updates, and values nested inside them.
+The statement planner does not independently extract an arbitrary `if`, loop,
+`switch`, `try`, catch, or `finally` region. An `if` may move as part of an eligible
+normally completing scoped block or an ordered scoped early-boolean-return region. Explicit
+labels, jumps, `break`, and `continue` remain in the logical method, while expression
+planning can still reduce large conditions, selectors, updates, and values nested
+inside them.
 
 This conservative boundary avoids inventing a protocol for non-local exits or moving
 code across exception handlers. A large method dominated by one indivisible control
@@ -472,7 +514,7 @@ Generated method names are derived from the logical method:
 
 - `evaluate$expression$1` for an expression helper;
 - `evaluate$statements$1` for a sequential statement helper;
-- `identical$conditions$1` for an early-false continuation helper.
+- `identical$conditions$1` for an early-boolean-return continuation helper.
 
 Characters that are not Java identifier parts are replaced with underscores, so a
 constructor helper begins with `_init_$expression$`.
@@ -552,25 +594,30 @@ The compiler does not pack a method's declared parameters. A logical method whos
 descriptor exceeds the JVM's 255-slot limit is invalid. Helper extraction is also
 skipped when captured locals would create a helper descriptor above that limit.
 
-### Multiple Live Outputs
+### Non-Trailing Multiple Live Outputs
 
-A sequential statement helper carries at most one modified local value back to its
-caller. A region that must return several independently modified locals is not moved
-as one unit. The planner may still find smaller zero-output or one-output regions
-around it.
+A sequential statement or non-trailing scoped-block helper carries at most one
+modified local value back to its caller. A trailing scoped-block sequence ending in
+the method's value return can instead use the allocation-free continuation chain
+described above. Other regions that must return several independently modified locals
+are not moved as one unit. The planner may still find smaller zero-output or
+one-output regions around them.
 
 ### Indivisible Control Flow
 
 Whole loops, exception regions, switches, and arbitrary jumps are not extracted.
-An `if/else` may move only as part of an eligible normally completing scoped block.
-Large expressions inside pinned structures can still split, but the structure itself
-remains in the logical method.
+An `if/else` may move only as part of an eligible normally completing scoped block or
+an ordered scoped early-boolean-return region. Large expressions inside pinned structures can
+still split, but the structure itself remains in the logical method.
 
 ### Class Sharding Constraints
 
 A generated-helper family containing a caller-sensitive or owner-sensitive helper is
-not sharded. If that class then exceeds a classfile structural limit, classfile
-emission fails rather than changing visibility or inventing cyclic runtime linkage.
+not sharded. Helpers with dependencies may be sharded when every generated call points
+to an earlier helper, producing an acyclic physical-class definition order. Forward
+or cyclic dependency shapes remain together. If that class then exceeds a classfile
+structural limit, classfile emission fails rather than changing visibility or
+inventing cyclic runtime linkage.
 
 ### Exact Size Is Known After Emission
 
@@ -606,7 +653,12 @@ The main executable splitting examples are:
 - `TestCompiledUnit.testConstantPoolPressureCreatesCompanionClasses`;
 - `TestAutomaticFlatHashSplitting.testTwoThousandFieldsThroughNominalAndHiddenClasses`;
 - `TestAutomaticFlatHashSplitting.testTenThousandFieldHashStress`;
-- `TestAutomaticRowConstructorSplitting.testBulkyFieldsAreSplitWithoutManualHelpers`.
+- `TestAutomaticRowConstructorSplitting.testBulkyFieldsAreSplitWithoutManualHelpers`;
+- `TestScopedBlockOutputSplitting.testScopedBlocksWithOneOutputSplit`;
+- `TestScopedBlockOutputSplitting.testTrailingScopedBlocksWithMultipleOutputsSplit`;
+- `TestScopedBlockOutputSplitting.testMultiOutputContinuationHelpersCanBeSharded`;
+- `TestScopedConditionSplitting.testScopedEarlyReturnConditionsSplit`;
+- `TestHiddenClassReceiverSplitting.testScopedConditionHelperUsesHiddenReceiver`.
 
 The FlatHash fixture builds the logical operations without manual chunks. It executes
 a 2,001-field strategy through both nominal and hidden definers, stress-tests a
@@ -617,19 +669,20 @@ creation.
 The row-constructor fixture models independently scoped, conditionally initialized
 fields without authored chunks. It verifies extraction of block-owned locals and
 `if/else` code while retaining captured-reference mutations, and separately verifies
-that blocks assigning a captured outer local are not moved.
+that one initialized captured outer local is returned to the caller.
 
 ## Future Considerations
 
 The following extensions are possible if real workloads require them. They are not
 part of the current splitting behavior.
 
-### Multiple-Output State Carriers
+### General Multiple-Output State Carriers
 
-The compiler could synthesize a record or another state carrier when an otherwise
-useful region has several live outputs. This would extend statement extraction but
-could add allocation, field traffic, or scalar-replacement dependence. It should be
-introduced only with workload evidence and explicit performance testing.
+For non-trailing regions, the compiler could synthesize a record or another state
+carrier when an otherwise useful region has several live outputs. This would extend
+statement extraction but could add allocation, field traffic, or scalar-replacement
+dependence. It should be introduced only with workload evidence and explicit
+performance testing.
 
 ### General Control-Flow Results
 
@@ -639,15 +692,17 @@ but it would make generated Java semantics and stack traces harder to understand
 
 ### Partial And Cyclic Class Sharding
 
-A dependency-aware sharder could move only a proven one-way subset of helpers. More
-aggressive designs could use mutable call sites or staged linkage for cycles. The
-current all-or-nothing movability rule deliberately avoids that runtime complexity.
+The sharder accepts a generated family whose dependencies all point backward in
+planner order, but it does not currently move only a proven acyclic subset of a more
+complicated family. More aggressive designs could compute strongly connected
+components or use mutable call sites or staged linkage for cycles. The current
+all-or-nothing movability rule deliberately avoids that runtime complexity.
 
 ### Iterative Exact-Size Replanning
 
-The compiler could use the first emitted classfile as feedback, adjust split
-boundaries, and emit again. This would reduce estimation error and support richer
-replanning diagnostics at the cost of compilation time and planner complexity.
+The compiler could use an emitted classfile as feedback, adjust split boundaries, and
+emit again. This would reduce estimation error and support richer replanning
+diagnostics at the cost of compilation time and planner complexity.
 
 ### Inline-Oriented Planning
 

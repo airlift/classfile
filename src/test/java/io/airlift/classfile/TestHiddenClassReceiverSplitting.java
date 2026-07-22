@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
 import static io.airlift.classfile.BytecodeExpressions.constantTrue;
 import static io.airlift.classfile.CodeBlock.block;
+import static io.airlift.classfile.CodeBlock.blockBuilder;
 import static java.lang.reflect.AccessFlag.FINAL;
 import static java.lang.reflect.AccessFlag.PRIVATE;
 import static java.lang.reflect.AccessFlag.PUBLIC;
@@ -94,6 +95,54 @@ class TestHiddenClassReceiverSplitting
 
         MethodHandle value = lookup.findVirtual(lookup.lookupClass(), "value", MethodType.methodType(boolean.class));
         assertThat((boolean) value.invoke(lookup.lookupClass().getConstructor().newInstance())).isTrue();
+    }
+
+    @Test
+    void testScopedConditionHelperUsesHiddenReceiver()
+            throws Throwable
+    {
+        ClassDefinition definition = newDefinition("ScopedConditions");
+        FieldDefinition field = definition.field("field", long.class).access(PRIVATE).build();
+        MethodDefinition method = definition.method("value", boolean.class).access(PUBLIC);
+        for (int index = 0; index < 1_000; index++) {
+            CodeBlock.Builder condition = blockBuilder();
+            Variable value = condition.declare("value", method.thisVariable().getField(field));
+            condition.append(IfStatement.builder()
+                    .condition(value.notEqual(constantLong(0)))
+                    .then(BytecodeExpressions.constantFalse().ret())
+                    .build());
+            method.body().append(condition.build());
+        }
+        method.body().ret(constantTrue());
+
+        MethodHandles.Lookup lookup = defineHidden(definition, "$conditions$");
+
+        MethodHandle value = lookup.findVirtual(lookup.lookupClass(), "value", MethodType.methodType(boolean.class));
+        assertThat((boolean) value.invoke(lookup.lookupClass().getConstructor().newInstance())).isTrue();
+    }
+
+    @Test
+    void testScopedEarlyTrueConditionHelperUsesHiddenReceiver()
+            throws Throwable
+    {
+        ClassDefinition definition = newDefinition("ScopedEarlyTrueConditions");
+        FieldDefinition field = definition.field("field", long.class).access(PRIVATE).build();
+        MethodDefinition method = definition.method("value", boolean.class).access(PUBLIC);
+        for (int index = 0; index < 1_000; index++) {
+            CodeBlock.Builder condition = blockBuilder();
+            Variable value = condition.declare("value", method.thisVariable().getField(field));
+            condition.append(IfStatement.builder()
+                    .condition(value.notEqual(constantLong(0)))
+                    .then(constantTrue().ret())
+                    .build());
+            method.body().append(condition.build());
+        }
+        method.body().ret(BytecodeExpressions.constantFalse());
+
+        MethodHandles.Lookup lookup = defineHidden(definition, "$conditions$");
+
+        MethodHandle value = lookup.findVirtual(lookup.lookupClass(), "value", MethodType.methodType(boolean.class));
+        assertThat((boolean) value.invoke(lookup.lookupClass().getConstructor().newInstance())).isFalse();
     }
 
     @Test
