@@ -164,10 +164,10 @@ an optimization could not be applied safely.
 
 The policy also records HotSpot's `MaxInlineSize` and `FreqInlineSize`, with defaults
 of 35 and 325 bytes. These values are included in the effective policy for inspection
-and experimentation. They do not currently cause additional splitting. Splitting
-large generated methods into hundreds of tiny methods merely to meet an inline limit
-would generally increase call overhead without guaranteeing that HotSpot will inline
-them.
+and experimentation. The statement planner uses `FreqInlineSize` as one signal for
+invocation-dense scoped sequences that can exhaust HotSpot's graph and inlining budget.
+It does not otherwise split methods merely to meet an inline limit; doing so would
+generally increase call overhead without guaranteeing that HotSpot will inline them.
 
 ### Hidden Lambda JIT Boundaries
 
@@ -287,8 +287,8 @@ physical helper descriptor and is independent of lexical local-slot reuse.
 
 ## Statement Splitting
 
-Statement planning runs after expression splitting. It considers an ordinary method
-only when the estimated method body exceeds the statement-planning budget:
+Statement planning runs after expression splitting. It normally considers an ordinary
+method when the estimated method body exceeds the statement-planning budget:
 
 ```text
 max(64, targetMethodCodeLimit * 3)
@@ -300,6 +300,26 @@ necessary, helper grouping uses the tighter two-times-target budget. The additio
 trigger headroom avoids splitting an ordinary emitted method that is already below
 the target, while the tighter grouping budget keeps generated helpers below it.
 Constructors, class initializers, and generated expression helpers are skipped.
+
+A secondary JIT-complexity trigger applies to long sequences of eligible scoped
+blocks. It activates when the sequence estimate exceeds the smaller of
+`targetMethodCodeLimit` and 7,200, the average block estimate exceeds
+`frequentInlineSize`, and each block averages at least two method invocations. This
+covers repeated field/operator regions that can exhaust C2's graph and inlining
+budgets below the ordinary huge-method target without splitting similarly sized
+call-free arithmetic. These regions use a tighter grouping budget:
+
+```text
+max(64, min(targetMethodCodeLimit, 7200) * 2 / 3)
+```
+
+Qualification and the tighter budget are local to the matching scoped sequence;
+unrelated statements in the same method retain the ordinary planning behavior.
+Zero-byte comments do not break a sequence. Compact and call-free sequences remain
+unsplit, avoiding helper calls around methods C2 can already optimize as a unit. The
+secondary trigger is disabled for intentionally tiny policies whose sequence budget
+does not exceed twice `frequentInlineSize`. As with the other planner heuristics, the
+exact physical boundary is not a public contract.
 
 The planner scans the top-level statements in the method body. It recognizes
 sequential expression regions, ordered early-boolean-return regions, and eligible nested
@@ -722,10 +742,10 @@ diagnostics at the cost of compilation time and planner complexity.
 
 ### Inline-Oriented Planning
 
-A final optimization pass could use `MaxInlineSize`, `FreqInlineSize`, call frequency,
-and caller size to preserve selected inline opportunities. Method size alone is not
-enough to make this reliable, so the current planner targets loadability and
-optimizing-compilation eligibility first.
+A broader optimization pass could use `MaxInlineSize`, call frequency, caller size,
+and runtime profile feedback to preserve selected inline opportunities. The current
+planner uses only a conservative `FreqInlineSize`-based signal for invocation-dense
+scoped sequences because method size alone is not enough to make this reliable.
 
 ### Richer Source-Level Diagnostics
 

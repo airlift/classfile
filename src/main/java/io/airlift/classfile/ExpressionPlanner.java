@@ -479,6 +479,119 @@ final class ExpressionPlanner
         };
     }
 
+    static Metrics metrics(Statement statement)
+    {
+        MetricsCounter counter = new MetricsCounter();
+        collectMetrics(statement, counter);
+        return new Metrics(counter.estimate, counter.invocations);
+    }
+
+    private static void collectMetrics(Statement statement, MetricsCounter counter)
+    {
+        switch (statement) {
+            case BytecodeExpression expression -> collectMetrics(expression, counter);
+            case Statements.Expression expression -> collectMetrics(expression.expression(), counter);
+            case Statements.InitializedDeclaration declaration -> {
+                counter.estimate += 4;
+                collectMetrics(declaration.initializer(), counter);
+            }
+            case Statements.Declaration _,
+                 Statements.Comment _,
+                 Statements.LabelBinding _ -> {}
+            case CodeBlock block -> block.statements().forEach(child -> collectMetrics(child, counter));
+            case IfStatement value -> {
+                counter.estimate += 12;
+                collectMetrics(value.condition(), counter);
+                collectMetrics(value.ifTrue(), counter);
+                collectMetrics(value.ifFalse(), counter);
+            }
+            case ForLoop value -> {
+                counter.estimate += 16;
+                collectMetrics(value.initializer(), counter);
+                collectMetrics(value.condition(), counter);
+                collectMetrics(value.update(), counter);
+                collectMetrics(value.body(), counter);
+            }
+            case WhileLoop value -> {
+                counter.estimate += 12;
+                collectMetrics(value.condition(), counter);
+                collectMetrics(value.body(), counter);
+            }
+            case DoWhileLoop value -> {
+                counter.estimate += 12;
+                collectMetrics(value.condition(), counter);
+                collectMetrics(value.body(), counter);
+            }
+            case SwitchStatement value -> {
+                counter.estimate += 16;
+                collectMetrics(value.expression(), counter);
+                value.cases().forEach(item -> collectMetrics(item.body(), counter));
+                collectMetrics(value.defaultCase(), counter);
+            }
+            case TryCatch value -> {
+                counter.estimate += 24;
+                collectMetrics(value.tryBlock(), counter);
+                value.catches().forEach(item -> collectMetrics(item.body(), counter));
+                value.finallyBlock().ifPresent(block -> collectMetrics(block, counter));
+            }
+            case LoopJump _,
+                 Statements.Jump _ -> counter.estimate += 8;
+            case Statements.ConstructorInvocation invocation -> {
+                counter.estimate += 8;
+                counter.invocations++;
+                invocation.arguments().forEach(argument -> collectMetrics(argument, counter));
+            }
+        }
+    }
+
+    private static void collectMetrics(BytecodeExpression expression, MetricsCounter counter)
+    {
+        switch (expression) {
+            case LocalValue _ -> counter.estimate += 4;
+            case SyntheticExpression synthetic -> {
+                ExpressionPlan expansion = synthetic.expansion(ExpansionContext.INSTANCE);
+                collectMetrics(expansion.setup(), counter);
+                collectMetrics(expansion.value(), counter);
+            }
+            case CoreExpression core -> {
+                counter.estimate += 8;
+                counter.invocations += switch (core.node()) {
+                    case ExpressionNode.Invoke _,
+                         ExpressionNode.NewInstance _,
+                         ExpressionNode.BoundMethodHandleInvocation _,
+                         ExpressionNode.LinkedMethodInvocation _,
+                         ExpressionNode.InvokeDynamic _ -> 1;
+                    case ExpressionNode.Constant _,
+                         ExpressionNode.Binary _,
+                         ExpressionNode.Unary _,
+                         ExpressionNode.Cast _,
+                         ExpressionNode.InstanceOf _,
+                         ExpressionNode.InlineIf _,
+                         ExpressionNode.ArrayLength _,
+                         ExpressionNode.ArrayGet _,
+                         ExpressionNode.ArraySet _,
+                         ExpressionNode.NewArray _,
+                         ExpressionNode.FieldGet _,
+                         ExpressionNode.FieldSet _,
+                         ExpressionNode.DynamicConstant _,
+                         ExpressionNode.BoundConstant _,
+                         ExpressionNode.SetVariable _,
+                         ExpressionNode.Increment _,
+                         ExpressionNode.Adapter _ -> 0;
+                };
+                core.node().children().forEach(child -> collectMetrics(child, counter));
+            }
+        }
+    }
+
+    record Metrics(int estimate, int invocations) {}
+
+    private static final class MetricsCounter
+    {
+        private int estimate;
+        private int invocations;
+    }
+
     static List<LocalValue> locals(BytecodeExpression expression)
     {
         LinkedHashSet<LocalValue> locals = new LinkedHashSet<>();
