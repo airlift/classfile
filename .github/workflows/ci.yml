@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow=${{ github.workflow }},ref=${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-commits-dispatcher:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit messages
+        uses: airlift/github-actions/check-commit-messages@1652e24519f5c7cec59d841070bf9beffadabdf9 # v1
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Select earlier commits
+        id: set-matrix
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Invalid pull request base ref: $BASE_REF" >&2
+            exit 1
+          fi
+
+          commits=$(git rev-list --reverse "origin/${BASE_REF}..HEAD")
+          lines_to_drop=1
+          if [[ -n "$commits" ]]; then
+            last_commit=$(tail -n 1 <<< "$commits")
+            if [[ $(git show -s --format='%P' "$last_commit" | wc -w) -gt 1 ]]; then
+              lines_to_drop=2
+            fi
+          fi
+
+          matrix=$(head -n "-${lines_to_drop}" <<< "$commits" |
+            jq -R -s -c 'split("\n") | map(select(length > 0)) | map({commit: .})')
+          if [[ "$matrix" == "[]" ]]; then
+            echo "matrix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":${matrix}}" >> "$GITHUB_OUTPUT"
+          fi
+
+  check-commit:
+    if: github.event_name == 'pull_request' && needs.check-commits-dispatcher.outputs.matrix != ''
+    needs: check-commits-dispatcher
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.check-commits-dispatcher.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+
+      - name: Compute tree hash
+        id: tree
+        run: echo "hash=$(git rev-parse HEAD:)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compile result
+        id: compile-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: compile-commit-success.txt
+          key: compile-commit-${{ github.event.pull_request.head.repo.full_name }}-${{ steps.tree.outputs.hash }}
+
+      - name: Install Java
+        if: steps.compile-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+
+      - name: Compile commit
+        if: steps.compile-cache.outputs.cache-hit != 'true'
+        run: ./mvnw clean package -B -V -DskipTests -Dair.check.skip-all
+
+      - name: Record compile success
+        if: steps.compile-cache.outputs.cache-hit != 'true'
+        run: echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > compile-commit-success.txt
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java-version:
+          - 25
+          - 26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+          cache: maven
+
+      - name: Build
+        run: ./mvnw clean install -B -V -P ci
+
+  ci-success:
+    if: always()
+    needs:
+      - check-commits-dispatcher
+      - check-commit
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check results
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CHECK_COMMIT_RESULT: ${{ needs.check-commit.result }}
+          DISPATCHER_RESULT: ${{ needs.check-commits-dispatcher.result }}
+        run: |
+          if [[ "$BUILD_RESULT" != success ]] ||
+              [[ "$CHECK_COMMIT_RESULT" == failure || "$CHECK_COMMIT_RESULT" == cancelled ]] ||
+              [[ "$DISPATCHER_RESULT" == failure || "$DISPATCHER_RESULT" == cancelled ]]; then
+            echo "CI failed: build=$BUILD_RESULT check-commit=$CHECK_COMMIT_RESULT dispatcher=$DISPATCHER_RESULT" >&2
+            exit 1
+          fi

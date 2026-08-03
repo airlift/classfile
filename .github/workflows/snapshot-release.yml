@@ -1,0 +1,72 @@
+name: Release snapshot version
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to release
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  snapshot-release:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: maven-publication
+      cancel-in-progress: false
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch }}
+          persist-credentials: false
+
+      - name: Install Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          java-version: 25
+          distribution: temurin
+          gpg-private-key: ${{ secrets.JRELEASER_GPG_SECRET_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          cache: maven
+
+      - name: Verify snapshot configuration
+        env:
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: |
+          ./mvnw -B njord:status | tee "${RUNNER_TEMP}/njord-status.log"
+          grep -F "Repository Auth: Present" "${RUNNER_TEMP}/njord-status.log"
+          grep -F "POM URL: https://central.sonatype.com/repository/maven-snapshots/" "${RUNNER_TEMP}/njord-status.log"
+
+      - name: Stage snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+        run: ./mvnw clean deploy -DskipTests -Poss-release -DaltDeploymentRepository=id::njord:snapshot
+
+      - name: Validate snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: |
+          ./mvnw njord:list
+          ./mvnw njord:status
+          ./mvnw njord:validate
+
+      - name: Publish snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: ./mvnw njord:publish -Poss-release
