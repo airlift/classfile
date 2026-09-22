@@ -9,7 +9,7 @@
     </parent>
 
     <artifactId>classfile</artifactId>
-    <version>1.0</version>
+    <version>1.1-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>Classfile</name>
@@ -29,7 +29,7 @@
     <scm>
         <connection>scm:git:https://github.com/airlift/classfile.git</connection>
         <developerConnection>scm:git:git@github.com:airlift/classfile.git</developerConnection>
-        <tag>1.0</tag>
+        <tag>HEAD</tag>
         <url>https://github.com/airlift/classfile</url>
     </scm>
 
