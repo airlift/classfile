@@ -557,6 +557,10 @@ public final class ClassCompiler
         }
         boolean[] aliases = new boolean[statements.size()];
         Set<Variable> writtenLater = Collections.newSetFromMap(new IdentityHashMap<>());
+        Predicate<Variable> recordWrite = variable -> {
+            writtenLater.add(variable);
+            return false;
+        };
         for (int index = statements.size() - 1; index >= 0; index--) {
             Statement statement = statements.get(index);
             if (statement instanceof Statements.InitializedDeclaration declaration &&
@@ -565,10 +569,7 @@ public final class ClassCompiler
                         !writtenLater.contains(declaration.variable()) &&
                         (!(source instanceof Variable sourceVariable) || !writtenLater.contains(sourceVariable));
             }
-            visitVariableWrites(statement, variable -> {
-                writtenLater.add(variable);
-                return false;
-            });
+            visitVariableWrites(statement, recordWrite);
         }
         return aliases;
     }
@@ -1048,13 +1049,29 @@ public final class ClassCompiler
                     visitVariableWrites(loop.body(), visitor);
             case WhileLoop loop -> visitVariableWrites(loop.condition(), visitor) || visitVariableWrites(loop.body(), visitor);
             case DoWhileLoop loop -> visitVariableWrites(loop.body(), visitor) || visitVariableWrites(loop.condition(), visitor);
-            case SwitchStatement switchStatement -> visitVariableWrites(switchStatement.expression(), visitor) ||
-                    switchStatement.cases().stream().anyMatch(caseValue -> visitVariableWrites(caseValue.body(), visitor)) ||
-                    visitVariableWrites(switchStatement.defaultCase(), visitor);
-            case TryCatch tryCatch -> visitVariableWrites(tryCatch.tryBlock(), visitor) ||
-                    tryCatch.catches().stream().anyMatch(catchClause -> visitVariableWrites(catchClause.body(), visitor)) ||
-                    tryCatch.finallyBlock().map(block -> visitVariableWrites(block, visitor)).orElse(false);
-            case Statements.ConstructorInvocation invocation -> invocation.arguments().stream().anyMatch(argument -> visitVariableWrites(argument, visitor));
+            case SwitchStatement switchStatement -> {
+                if (visitVariableWrites(switchStatement.expression(), visitor)) {
+                    yield true;
+                }
+                for (SwitchStatement.Case caseValue : switchStatement.cases()) {
+                    if (visitVariableWrites(caseValue.body(), visitor)) {
+                        yield true;
+                    }
+                }
+                yield visitVariableWrites(switchStatement.defaultCase(), visitor);
+            }
+            case TryCatch tryCatch -> {
+                if (visitVariableWrites(tryCatch.tryBlock(), visitor)) {
+                    yield true;
+                }
+                for (TryCatch.CatchClause catchClause : tryCatch.catches()) {
+                    if (visitVariableWrites(catchClause.body(), visitor)) {
+                        yield true;
+                    }
+                }
+                yield tryCatch.finallyBlock().isPresent() && visitVariableWrites(tryCatch.finallyBlock().orElseThrow(), visitor);
+            }
+            case Statements.ConstructorInvocation invocation -> visitVariableWrites(invocation.arguments(), visitor);
             case Statements.Declaration _,
                  Statements.Comment _,
                  Statements.Jump _,
@@ -1065,7 +1082,23 @@ public final class ClassCompiler
 
     private static boolean visitVariableWrites(CodeBlock block, Predicate<Variable> visitor)
     {
-        return block.statements().stream().anyMatch(statement -> visitVariableWrites(statement, visitor));
+        List<Statement> statements = block.statements();
+        for (int index = 0; index < statements.size(); index++) {
+            if (visitVariableWrites(statements.get(index), visitor)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean visitVariableWrites(List<BytecodeExpression> expressions, Predicate<Variable> visitor)
+    {
+        for (int index = 0; index < expressions.size(); index++) {
+            if (visitVariableWrites(expressions.get(index), visitor)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean visitVariableWrites(BytecodeExpression expression, Predicate<Variable> visitor)
@@ -1079,7 +1112,7 @@ public final class ClassCompiler
             case CoreExpression core -> switch (core.node()) {
                 case ExpressionNode.SetVariable setVariable -> visitor.test(setVariable.variable()) || visitVariableWrites(setVariable.value(), visitor);
                 case ExpressionNode.Increment increment -> visitor.test(increment.variable());
-                default -> core.node().children().stream().anyMatch(child -> visitVariableWrites(child, visitor));
+                default -> visitVariableWrites(core.node().children(), visitor);
             };
         };
     }
@@ -1796,14 +1829,15 @@ public final class ClassCompiler
         private final BindingCollector bindingCollector;
         private final LinkageContext linkage;
         private final Map<LocalValue, LocalBinding> bindings = new IdentityHashMap<>();
-        private final Set<LocalValue> predeclaredAliases = Collections.newSetFromMap(new IdentityHashMap<>());
-        private final Set<LocalValue> nonOwningBindings = Collections.newSetFromMap(new IdentityHashMap<>());
         private final ArrayDeque<List<LocalValue>> scopes = new ArrayDeque<>();
-        private final Map<Object, LoopLabels> loops = new IdentityHashMap<>();
         private final ArrayDeque<Map<CodeLabel, LabelTarget>> labelScopes = new ArrayDeque<>();
         private final ArrayDeque<Integer> freeOneSlotLocals = new ArrayDeque<>();
         private final ArrayDeque<Integer> freeTwoSlotLocals = new ArrayDeque<>();
         private final ArrayList<FinalizerFrame> finalizers = new ArrayList<>();
+        // Alias and loop tracking is created on first use, as most methods have neither.
+        private Set<LocalValue> predeclaredAliases;
+        private Set<LocalValue> nonOwningBindings;
+        private Map<Object, LoopLabels> loops;
         private int finalizerDepth;
 
         private EmitContext(ClassModel definition, MethodDefinition.Model method, CodeBuilder code, BindingCollector bindings, LinkageContext linkage)
@@ -1840,6 +1874,10 @@ public final class ClassCompiler
 
         private void enterBlock(CodeBlock block)
         {
+            if (block.labels().isEmpty()) {
+                labelScopes.push(Map.of());
+                return;
+            }
             Map<CodeLabel, LabelTarget> labels = new IdentityHashMap<>();
             block.labels().forEach(label -> labels.put(label, new LabelTarget(code.newLabel(), finalizerDepth)));
             labelScopes.push(labels);
@@ -1880,16 +1918,19 @@ public final class ClassCompiler
         {
             for (LocalValue variable : scopes.pop()) {
                 LocalBinding binding = bindings.remove(variable);
-                predeclaredAliases.remove(variable);
-                if (!nonOwningBindings.remove(variable)) {
-                    release(binding);
+                if (predeclaredAliases != null) {
+                    predeclaredAliases.remove(variable);
+                    if (nonOwningBindings.remove(variable)) {
+                        continue;
+                    }
                 }
+                release(binding);
             }
         }
 
         private void declare(Variable variable)
         {
-            if (predeclaredAliases.remove(variable)) {
+            if (predeclaredAliases != null && predeclaredAliases.remove(variable)) {
                 return;
             }
             if (bindings.containsKey(variable)) {
@@ -1910,6 +1951,10 @@ public final class ClassCompiler
             }
             bindings.put(alias, targetBinding);
             scopes.getFirst().add(alias);
+            if (predeclaredAliases == null) {
+                predeclaredAliases = Collections.newSetFromMap(new IdentityHashMap<>());
+                nonOwningBindings = Collections.newSetFromMap(new IdentityHashMap<>());
+            }
             predeclaredAliases.add(alias);
             nonOwningBindings.add(alias);
         }
@@ -1977,6 +2022,9 @@ public final class ClassCompiler
 
         private void enterLoop(Object target, Label breakTarget, Label continueTarget)
         {
+            if (loops == null) {
+                loops = new IdentityHashMap<>();
+            }
             if (loops.put(target, new LoopLabels(breakTarget, continueTarget, finalizerDepth)) != null) {
                 throw new CompilationException("Loop target is already active");
             }
@@ -1989,7 +2037,7 @@ public final class ClassCompiler
 
         private LoopLabels loop(Object target)
         {
-            LoopLabels labels = loops.get(target);
+            LoopLabels labels = loops == null ? null : loops.get(target);
             if (labels == null) {
                 throw new CompilationException("Loop jump is outside its target loop");
             }
