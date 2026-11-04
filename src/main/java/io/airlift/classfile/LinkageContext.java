@@ -13,12 +13,14 @@
  */
 package io.airlift.classfile;
 
+import java.io.Serializable;
 import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -28,6 +30,7 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import static io.airlift.classfile.Identity.same;
+import static java.lang.constant.ConstantDescs.CD_Object;
 import static java.lang.reflect.AccessFlag.INTERFACE;
 import static java.lang.reflect.AccessFlag.PUBLIC;
 import static java.util.Objects.requireNonNull;
@@ -38,6 +41,8 @@ final class LinkageContext
     private final CompilationTarget target;
     private final Map<ClassDesc, ClassModel> generatedDefinitions;
     private final ClassHierarchyResolver hierarchyResolver;
+    // Class resolution results for assignability checks, including types that do not resolve.
+    private final Map<ClassDesc, Optional<Class<?>>> resolvedClasses = new HashMap<>();
 
     LinkageContext(CompilationTarget target, List<ClassModel> definitions)
     {
@@ -124,6 +129,99 @@ final class LinkageContext
     {
         return ClassHierarchyResolver.ClassHierarchyInfo.ofInterface()
                 .equals(hierarchyResolver.getClassInfo(requireNonNull(type, "type is null")));
+    }
+
+    /// Returns whether the verifier accepts a value of the source type where the target type is
+    /// declared (JVMS 4.10.1.2). An interface target accepts any non-array reference; an array is
+    /// accepted only by `Cloneable` and `Serializable`. A type that does not resolve, or a hidden
+    /// class's type when the hidden class shares its name with a loaded class, passes, deferring
+    /// to the JVM.
+    boolean isAssignable(ClassDesc target, ClassDesc source)
+    {
+        requireNonNull(target, "target is null");
+        requireNonNull(source, "source is null");
+        if (target.isPrimitive() || source.isPrimitive() || target.equals(source) || target.equals(CD_Object)) {
+            return true;
+        }
+        if (target.isArray()) {
+            if (!source.isArray()) {
+                return false;
+            }
+            ClassDesc targetComponent = target.componentType();
+            ClassDesc sourceComponent = source.componentType();
+            if (targetComponent.isPrimitive() || sourceComponent.isPrimitive()) {
+                return targetComponent.equals(sourceComponent);
+            }
+            return isAssignable(targetComponent, sourceComponent);
+        }
+
+        ClassModel generatedTarget = generatedDefinitions.get(target);
+        Class<?> targetClass = null;
+        if (generatedTarget != null) {
+            if (sharesLoadedName(target)) {
+                return true;
+            }
+            if (source.isArray()) {
+                return false;
+            }
+            if (generatedTarget.access().contains(INTERFACE)) {
+                return true;
+            }
+        }
+        else {
+            Optional<Class<?>> resolved = resolveClass(target);
+            if (resolved.isEmpty()) {
+                return true;
+            }
+            targetClass = resolved.orElseThrow();
+            if (source.isArray()) {
+                return targetClass == Cloneable.class || targetClass == Serializable.class;
+            }
+            if (targetClass.isInterface()) {
+                return true;
+            }
+        }
+
+        // Walk generated superclasses first. A generated interface has no superclass path beyond
+        // Object, which the target is not, so the walk stops there.
+        ClassDesc current = source;
+        ClassModel generatedSource = generatedDefinitions.get(current);
+        while (generatedSource != null) {
+            if (sharesLoadedName(current)) {
+                return true;
+            }
+            if (generatedSource.access().contains(INTERFACE)) {
+                return false;
+            }
+            current = generatedSource.superClass();
+            if (current.equals(target)) {
+                return true;
+            }
+            generatedSource = generatedDefinitions.get(current);
+        }
+        Optional<Class<?>> sourceClass = resolveClass(current);
+        if (sourceClass.isEmpty()) {
+            return true;
+        }
+        // A loaded class cannot extend a type generated in this unit.
+        return targetClass != null && targetClass.isAssignableFrom(sourceClass.orElseThrow());
+    }
+
+    // A hidden class can take the name of a loaded class. A descriptor naming the generated type
+    // then also names the loaded class, so the verifier's view of the type is unknown.
+    private boolean sharesLoadedName(ClassDesc generatedType)
+    {
+        return target.hiddenClass() && resolveClass(generatedType).isPresent();
+    }
+
+    private Optional<Class<?>> resolveClass(ClassDesc type)
+    {
+        Optional<Class<?>> resolved = resolvedClasses.get(type);
+        if (resolved == null) {
+            resolved = target.resolveClass(type);
+            resolvedClasses.put(type, resolved);
+        }
+        return resolved;
     }
 
     boolean isPublicMethod(ClassDesc owner, String name, MethodTypeDesc methodType)

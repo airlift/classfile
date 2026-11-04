@@ -632,11 +632,27 @@ model path before class definition. Runtime-bound method handles are the deliber
 exception: their original signatures are input to target adaptation rather than
 ordinary symbolic references.
 
+Linkage validation also checks reference assignability where a value flows into a
+declared type: a local store or initializer, a field write, an invocation, constructor,
+or invokedynamic argument, an instance member's receiver, and a returned or thrown
+value, with every catch type required to be a `Throwable`. It applies the verifier's
+rule (JVMS 4.10.1.2): an interface type accepts any reference except an array, as the
+verifier treats it as `Object`, and accepts an array only when the interface is
+`Cloneable` or `Serializable`; an array type accepts only an array, its component types
+are checked recursively, and primitive components must match; and a class needs the
+source's superclass chain to reach it. Only a value whose verifier type is its model
+type is checked, such as a constant, cast, field read, or invocation result; a local's
+declared type is not trusted as a source, because the verifier tracks the type last
+stored in it. A `null` constant, an array element store, and a hidden class's own type
+when a loaded class shares its name are left to the JVM.
+
 These rules describe the code the model supports, not every class the verifier accepts.
-The model is built for structured code, just as it is built for structured use of the
-operand stack rather than arbitrary stack manipulation. A value an earlier scope left in
-a reused slot does not assign a later local, even of the same type, and copying an
-unassigned local, as in `y = x`, is an unassigned read.
+The model is built for structured, well-typed code, just as it is built for structured
+use of the operand stack rather than arbitrary stack manipulation. A value an earlier
+scope left in a reused slot does not assign a later local, even of the same type, and
+copying an unassigned local, as in `y = x`, is an unassigned read. A local holds only
+values assignable to its declared type, even a value that is never used as that type,
+and reference assignability is checked even in code the compiler folds away.
 
 The validator may memoize context-free properties, but it must not use a global
 identity-based visited set for context-sensitive placement validation.

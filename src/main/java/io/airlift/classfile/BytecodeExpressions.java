@@ -845,8 +845,9 @@ public final class BytecodeExpressions
                 throw new IllegalArgumentException(name + " type " + source.displayName() + " is not assignable to " + target.displayName());
             }
         }
-        // Symbolic descriptors do not provide hierarchy resolution. Reference
-        // assignability is verified by the JVM at linkage or by an optional resolver.
+        // Symbolic descriptors do not provide hierarchy resolution. Linkage validation
+        // checks reference assignability against the compilation target's classes,
+        // except for array element stores, which are left to the JVM.
     }
 
     private static void validateCast(ClassDesc source, ClassDesc target)

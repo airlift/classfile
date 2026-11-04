@@ -91,19 +91,48 @@ final class HiddenClassLinkage
                         MethodTypeDesc.ofDescriptor(implementation.lookupDescriptor())));
     }
 
-    private static Optional<LambdaSite> lambdaSite(DynamicCallSiteDesc callSite, ClassDesc currentOwner)
+    /// Returns whether [#rewrite] replaces the call site, or rejects it as an unsupported
+    /// hidden-class lambda site, rather than leaving it unchanged.
+    static boolean rewrites(DynamicCallSiteDesc callSite, ClassDesc currentOwner)
     {
-        if (!(callSite.bootstrapMethod() instanceof DirectMethodHandleDesc bootstrap) ||
-                (!bootstrap.equals(METAFACTORY) && !bootstrap.equals(ALT_METAFACTORY))) {
-            return Optional.empty();
-        }
+        MethodHandleDesc bootstrap = callSite.bootstrapMethod();
+        return isMetafactory(bootstrap) && rewrites(bootstrap, callSite.bootstrapArgs(), currentOwner);
+    }
 
-        ConstantDesc[] arguments = callSite.bootstrapArgs();
+    // Matches the arguments of a site whose bootstrap is one of the LambdaMetafactory factories.
+    private static boolean rewrites(MethodHandleDesc bootstrap, ConstantDesc[] arguments, ClassDesc currentOwner)
+    {
         if (arguments.length < 2 ||
                 !(arguments[1] instanceof DirectMethodHandleDesc implementation) ||
                 !implementation.owner().equals(currentOwner)) {
+            return false;
+        }
+        return bootstrap.equals(ALT_METAFACTORY) || (arguments.length == 3 && arguments[0] instanceof MethodTypeDesc && arguments[2] instanceof MethodTypeDesc);
+    }
+
+    private static boolean isMetafactory(MethodHandleDesc bootstrap)
+    {
+        return bootstrap.equals(METAFACTORY) || bootstrap.equals(ALT_METAFACTORY);
+    }
+
+    /// Returns whether the rewrite replaces the type with `Object`: the type is the current owner
+    /// or an array of it.
+    static boolean namesOwner(ClassDesc type, ClassDesc currentOwner)
+    {
+        return RuntimeDataRequirements.componentType(type).equals(currentOwner);
+    }
+
+    private static Optional<LambdaSite> lambdaSite(DynamicCallSiteDesc callSite, ClassDesc currentOwner)
+    {
+        MethodHandleDesc bootstrap = callSite.bootstrapMethod();
+        if (!isMetafactory(bootstrap)) {
             return Optional.empty();
         }
+        ConstantDesc[] arguments = callSite.bootstrapArgs();
+        if (!rewrites(bootstrap, arguments, currentOwner)) {
+            return Optional.empty();
+        }
+        DirectMethodHandleDesc implementation = (DirectMethodHandleDesc) arguments[1];
         if (bootstrap.equals(ALT_METAFACTORY)) {
             if (arguments.length != 4 ||
                     !(arguments[0] instanceof MethodTypeDesc) ||
@@ -114,11 +143,6 @@ final class HiddenClassLinkage
             if (flags != 0) {
                 throw new CompilationException("Hidden-class LambdaMetafactory.altMetafactory flags " + flags + " are not supported");
             }
-        }
-        else if (arguments.length != 3 ||
-                !(arguments[0] instanceof MethodTypeDesc) ||
-                !(arguments[2] instanceof MethodTypeDesc)) {
-            return Optional.empty();
         }
         MethodTypeDesc samMethodType = (MethodTypeDesc) arguments[0];
         MethodTypeDesc instantiatedMethodType = (MethodTypeDesc) arguments[2];
@@ -147,11 +171,7 @@ final class HiddenClassLinkage
 
     private static ClassDesc safeType(ClassDesc type, ClassDesc currentOwner)
     {
-        ClassDesc componentType = type;
-        while (componentType.isArray()) {
-            componentType = componentType.componentType();
-        }
-        return componentType.equals(currentOwner) ? CD_Object : type;
+        return namesOwner(type, currentOwner) ? CD_Object : type;
     }
 
     record MethodReference(String name, MethodTypeDesc type)

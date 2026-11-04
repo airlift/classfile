@@ -29,6 +29,7 @@ import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.invoke.StringConcatFactory;
 import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
@@ -41,6 +42,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.IntUnaryOperator;
@@ -64,6 +66,7 @@ import static java.lang.constant.ConstantDescs.CD_MethodHandles_Lookup;
 import static java.lang.constant.ConstantDescs.CD_MethodType;
 import static java.lang.constant.ConstantDescs.CD_Object;
 import static java.lang.constant.ConstantDescs.CD_String;
+import static java.lang.constant.ConstantDescs.CD_Throwable;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.constant.ConstantDescs.CD_void;
 import static java.lang.invoke.MethodHandles.Lookup.ClassOption.NESTMATE;
@@ -1186,7 +1189,7 @@ class TestRuntimeDefiners
     private static MethodDefinition unverifiableEvaluate(ClassDefinition definition)
     {
         MethodDefinition evaluate = definition.method("evaluate", CD_int).access(PUBLIC, STATIC);
-        // Model validation leaves reference assignability to the verifier, so only the verifier rejects this receiver.
+        // Linkage validation does not trust a local's declared type, so only the verifier rejects this receiver.
         Variable value = evaluate.body().declare("value", constantString("x").cast(Object.class));
         evaluate.body().ret(value.invokeVirtual(classDesc(Number.class), "intValue", MethodTypeDesc.of(CD_int)));
         return evaluate;
@@ -1467,6 +1470,114 @@ class TestRuntimeDefiners
     }
 
     @Test
+    void testReferenceAssignabilityFailsWithModelPath()
+            throws Throwable
+    {
+        ClassDefinition local = ClassDefinition.define(generatedClass("LocalMismatch")).access(PUBLIC, FINAL);
+        MethodDefinition localMethod = local.method("run", CD_int).access(PUBLIC, STATIC);
+        Variable number = localMethod.body().declare(Number.class, "number");
+        localMethod.body().append(number.set(constantString("x"))).ret(number.invoke("intValue", int.class));
+        assertLinkageFailure(local, "method run()I body statement 1", "value of type String is not assignable to local number of type Number");
+
+        ClassDefinition returned = ClassDefinition.define(generatedClass("ReturnMismatch")).access(PUBLIC, FINAL);
+        returned.method("run", Integer.class).access(PUBLIC, STATIC).body().ret(constantString("x"));
+        assertLinkageFailure(returned, "method run()Ljava/lang/Integer; body statement 0", "return value of type String is not assignable to return type Integer");
+
+        ClassDefinition argument = ClassDefinition.define(generatedClass("ArgumentMismatch")).access(PUBLIC, FINAL);
+        argument.method("run", String.class).access(PUBLIC, STATIC).body()
+                .ret(invokeStatic(String.class, "valueOf", MethodTypeDesc.of(CD_String, classDesc(char[].class)), constantString("x")));
+        assertLinkageFailure(
+                argument,
+                "method run()Ljava/lang/String; body statement 0 operand 0",
+                "argument 0 of type String for valueOf is not assignable to parameter type char[]");
+
+        ClassDefinition receiver = ClassDefinition.define(generatedClass("ReceiverMismatch")).access(PUBLIC, FINAL);
+        receiver.method("run", CD_int).access(PUBLIC, STATIC).body()
+                .ret(constantString("x").invokeVirtual(classDesc(Number.class), "intValue", MethodTypeDesc.of(CD_int)));
+        assertLinkageFailure(receiver, "method run()I body statement 0 operand 0", "receiver of type String for intValue is not assignable to Number");
+
+        ClassDefinition catchType = ClassDefinition.define(generatedClass("CatchTypeMismatch")).access(PUBLIC, FINAL);
+        catchType.method("run", CD_void).access(PUBLIC, STATIC).body()
+                .append(TryCatch.builder()
+                        .tryBlock(invokeStatic(Integer.class, "valueOf", Integer.class, constantInt(1)).pop())
+                        .catching(CD_String, "failure", (_, _) -> {})
+                        .build())
+                .ret();
+        assertLinkageFailure(catchType, "method run()V body statement 0 catch type", "catch type String is not a subclass of Throwable");
+
+        ClassDefinition field = ClassDefinition.define(generatedClass("FieldMismatch")).access(PUBLIC, FINAL);
+        FieldDefinition numberField = field.field("number", Number.class).access(PUBLIC, STATIC).build();
+        field.method("run", CD_void).access(PUBLIC, STATIC).body().append(setStatic(numberField, constantString("x"))).ret();
+        assertLinkageFailure(field, "method run()V body statement 0", "value of type String is not assignable to field number of type Number");
+
+        ClassDefinition thrown = ClassDefinition.define(generatedClass("ThrowMismatch")).access(PUBLIC, FINAL);
+        thrown.method("run", CD_void).access(PUBLIC, STATIC).body().append(constantString("x").throwObject());
+        assertLinkageFailure(thrown, "method run()V body statement 0", "thrown value of type String is not a subclass of Throwable");
+
+        ClassDefinition superArgument = ClassDefinition.define(generatedClass("SuperArgumentMismatch"))
+                .access(PUBLIC, FINAL)
+                .superClass(Exception.class);
+        superArgument.constructor().access(PUBLIC).body()
+                .invokeSuperConstructor(MethodTypeDesc.of(CD_void, CD_Throwable), constantString("x"))
+                .ret();
+        assertLinkageFailure(superArgument, "method <init>()V body statement 0", "argument 0 of type String for <init> is not assignable to parameter type Throwable");
+
+        ClassDefinition newArgument = ClassDefinition.define(generatedClass("NewInstanceArgumentMismatch")).access(PUBLIC, FINAL);
+        newArgument.method("run", Exception.class).access(PUBLIC, STATIC).body()
+                .ret(BytecodeExpressions.newInstance(classDesc(Exception.class), MethodTypeDesc.of(CD_void, CD_Throwable), constantString("x")));
+        assertLinkageFailure(
+                newArgument,
+                "method run()Ljava/lang/Exception; body statement 0 operand 0",
+                "argument 0 of type String for <init> is not assignable to parameter type Throwable");
+
+        // The verifier accepts an array for an interface type only when the interface is Cloneable or Serializable.
+        ClassDefinition arrayInterfaceTarget = ClassDefinition.define(generatedClass("ArrayInterfaceTarget")).access(PUBLIC, FINAL);
+        arrayInterfaceTarget.method("run", Runnable.class).access(PUBLIC, STATIC).body().ret(newArray(String[].class, 0));
+        assertLinkageFailure(arrayInterfaceTarget, "method run()Ljava/lang/Runnable; body statement 0", "return value of type String[] is not assignable to return type Runnable");
+
+        // A hidden class keeps its own type at a call site that is not a rewritten lambda site.
+        ClassDefinition hiddenCallSite = ClassDefinition.define(generatedClass("HiddenCallSite")).access(PUBLIC, FINAL);
+        DynamicCallSiteDesc concat = DynamicCallSiteDesc.of(
+                MethodHandleDesc.ofMethod(
+                        DirectMethodHandleDesc.Kind.STATIC,
+                        classDesc(StringConcatFactory.class),
+                        "makeConcat",
+                        MethodTypeDesc.of(CD_CallSite, CD_MethodHandles_Lookup, CD_String, CD_MethodType)),
+                "concat",
+                MethodTypeDesc.of(CD_String, hiddenCallSite.type()));
+        hiddenCallSite.method("run", String.class).access(PUBLIC, STATIC).body().ret(invokeDynamic(concat, constantString("x")));
+        assertThatThrownBy(() -> HiddenClassDefiner.builder(MethodHandles.lookup()).build().defineClass(hiddenCallSite.build()))
+                .isInstanceOf(CompilationException.class)
+                .hasMessage(
+                        "Linkage validation failed for %s:%n  %s%n  %s",
+                        hiddenCallSite.type().displayName(),
+                        "method run()Ljava/lang/String; body statement 0 operand 0",
+                        "argument 0 of type String for concat is not assignable to parameter type " + hiddenCallSite.type().displayName());
+
+        // The verifier treats an interface type as Object, so a String returned as a Runnable defines and runs.
+        ClassDefinition interfaceTarget = ClassDefinition.define(generatedClass("InterfaceTarget")).access(PUBLIC, FINAL);
+        interfaceTarget.method("run", Runnable.class).access(PUBLIC, STATIC).body().ret(constantString("x"));
+        Class<?> generated = StandardClassDefiner.builder(getClass().getClassLoader()).build().defineClass(interfaceTarget.build());
+        assertThat(generated.getMethod("run").invoke(null)).isEqualTo("x");
+
+        // A hidden class may take the name of a loaded class, which its descriptors then still name.
+        ClassDefinition sharedName = ClassDefinition.define(classDesc(NominalNumber.class)).access(PUBLIC, FINAL);
+        sharedName.method("run", Number.class).access(PUBLIC, STATIC).body()
+                .ret(invokeStatic(TestRuntimeDefiners.class, "nominalNumber", NominalNumber.class));
+        MethodHandles.Lookup hidden = HiddenClassDefiner.builder(MethodHandles.lookup()).build().defineClass(sharedName.build());
+        assertThat(hidden.findStatic(hidden.lookupClass(), "run", MethodType.methodType(Number.class)).invoke()).isInstanceOf(NominalNumber.class);
+    }
+
+    private void assertLinkageFailure(ClassDefinition definition, String location, String problem)
+    {
+        assertThatThrownBy(() -> StandardClassDefiner.builder(getClass().getClassLoader())
+                .build()
+                .defineClass(definition.build()))
+                .isInstanceOf(CompilationException.class)
+                .hasMessage("Linkage validation failed for %s:%n  %s%n  %s", definition.type().displayName(), location, problem);
+    }
+
+    @Test
     void testBoundMethodHandleChecksExactClassIdentity()
             throws Throwable
     {
@@ -1532,6 +1643,14 @@ class TestRuntimeDefiners
     }
 
     public static final class PublicValue {}
+
+    public static NominalNumber nominalNumber()
+    {
+        return new NominalNumber();
+    }
+
+    public static final class NominalNumber
+            extends AtomicInteger {}
 
     private static byte[] classBytes(Class<?> type)
             throws IOException

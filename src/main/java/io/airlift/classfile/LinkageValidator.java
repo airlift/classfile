@@ -29,6 +29,10 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
+import static java.lang.constant.ConstantDescs.CD_Object;
+import static java.lang.constant.ConstantDescs.CD_Throwable;
+import static java.lang.constant.ConstantDescs.CD_void;
+import static java.lang.constant.ConstantDescs.INIT_NAME;
 import static java.util.Objects.requireNonNull;
 
 final class LinkageValidator
@@ -60,6 +64,8 @@ final class LinkageValidator
     private static final class Context
     {
         private static final int NO_OPERAND = -1;
+        // Bounds the search for a value's verifier type; a deeper value is not checked.
+        private static final int MAX_EXACT_DEPTH = 32;
 
         private final ClassModel definition;
         private final LinkageContext linkage;
@@ -76,6 +82,7 @@ final class LinkageValidator
         private int[] pendingLocationLengths = new int[32];
         private int[] pendingOperands = new int[32];
         private int pendingCount;
+        private ClassDesc returnType = CD_void;
 
         private Context(ClassModel definition, LinkageContext linkage, Optional<Object> classData)
         {
@@ -88,6 +95,7 @@ final class LinkageValidator
         {
             location.setLength(0);
             location.append("method ").append(method.name()).append(method.methodType().descriptorString());
+            returnType = method.methodType().returnType();
             methodType(method.methodType(), "");
             for (int index = 0; index < method.exceptions().size(); index++) {
                 type(method.exceptions().get(index), " exception ", index);
@@ -102,7 +110,7 @@ final class LinkageValidator
             Optional<String> problem = accessProblem(type);
             if (problem.isPresent()) {
                 enter(segment);
-                throw accessFailure(problem.orElseThrow());
+                throw failure(problem.orElseThrow());
             }
         }
 
@@ -111,7 +119,7 @@ final class LinkageValidator
             Optional<String> problem = accessProblem(type);
             if (problem.isPresent()) {
                 enter(segment, index);
-                throw accessFailure(problem.orElseThrow());
+                throw failure(problem.orElseThrow());
             }
         }
 
@@ -120,7 +128,7 @@ final class LinkageValidator
             Optional<String> problem = accessProblem(type);
             if (problem.isPresent()) {
                 enter(segment, name);
-                throw accessFailure(problem.orElseThrow());
+                throw failure(problem.orElseThrow());
             }
         }
 
@@ -136,7 +144,7 @@ final class LinkageValidator
             return problem;
         }
 
-        private CompilationException accessFailure(String problem)
+        private CompilationException failure(String problem)
         {
             return LinkageContext.linkageFailure(definition, location.toString(), problem);
         }
@@ -211,6 +219,10 @@ final class LinkageValidator
                     statement(tryCatch.tryBlock(), " try");
                     for (TryCatch.CatchClause catchClause : tryCatch.catches()) {
                         type(catchClause.exceptionType(), " catch type");
+                        if (!linkage.isAssignable(CD_Throwable, catchClause.exceptionType())) {
+                            enter(" catch type");
+                            throw failure("catch type %s is not a subclass of Throwable".formatted(catchClause.exceptionType().displayName()));
+                        }
                         type(catchClause.variable().type(), " catch variable ", catchClause.variable().name());
                         int mark = enter(" catch ", catchClause.exceptionType().displayName());
                         statement(catchClause.body());
@@ -231,12 +243,14 @@ final class LinkageValidator
                     };
                     type(owner, " constructor owner");
                     methodType(invocation.constructorType(), " constructor");
+                    arguments(INIT_NAME, invocation.constructorType(), invocation.arguments(), false);
                     expressions(invocation.arguments(), " constructor argument");
                 }
                 case Statements.Declaration declaration -> type(declaration.variable().type(), " local ", declaration.variable().name());
                 case Statements.Expression expression -> expression(expression.expression(), "");
                 case Statements.InitializedDeclaration declaration -> {
                     type(declaration.variable().type(), " local ", declaration.variable().name());
+                    local(declaration.variable(), declaration.initializer());
                     expression(declaration.initializer(), " initializer");
                 }
             }
@@ -310,8 +324,15 @@ final class LinkageValidator
                 case ExpressionNode.Binary _,
                      ExpressionNode.Unary _,
                      ExpressionNode.InlineIf _,
-                     ExpressionNode.ArrayLength _,
-                     ExpressionNode.Adapter _ -> {}
+                     ExpressionNode.ArrayLength _ -> {}
+                case ExpressionNode.Adapter adapter -> {
+                    if (adapter.keyword().equals("return") && rejects(returnType, adapter.value())) {
+                        throw failure("return value of type %s is not assignable to return type %s".formatted(adapter.value().type().displayName(), returnType.displayName()));
+                    }
+                    if (adapter.keyword().equals("throw") && rejects(CD_Throwable, adapter.value())) {
+                        throw failure("thrown value of type %s is not a subclass of Throwable".formatted(adapter.value().type().displayName()));
+                    }
+                }
                 case ExpressionNode.Cast cast -> type(cast.type(), " cast type");
                 case ExpressionNode.InstanceOf instanceOf -> type(instanceOf.testType(), " instanceof type");
                 case ExpressionNode.ArrayGet arrayGet -> type(arrayGet.array().type(), " array type");
@@ -320,18 +341,33 @@ final class LinkageValidator
                 case ExpressionNode.FieldGet field -> {
                     type(field.owner(), " field owner");
                     type(field.type(), " field type");
+                    if (!field.isStatic()) {
+                        receiver(field.name(), field.owner(), field.target());
+                    }
                 }
                 case ExpressionNode.FieldSet field -> {
                     type(field.owner(), " field owner");
                     type(field.fieldType(), " field type");
+                    if (!field.isStatic()) {
+                        receiver(field.name(), field.owner(), field.target());
+                    }
+                    if (rejects(field.fieldType(), field.value())) {
+                        throw failure("value of type %s is not assignable to field %s of type %s"
+                                .formatted(field.value().type().displayName(), field.name(), field.fieldType().displayName()));
+                    }
                 }
                 case ExpressionNode.Invoke invoke -> {
                     type(invoke.owner(), " invocation owner");
                     methodType(invoke.methodType(), " invocation descriptor");
+                    if (invoke.kind() != ExpressionNode.InvocationKind.STATIC) {
+                        receiver(invoke.name(), invoke.owner(), invoke.target());
+                    }
+                    arguments(invoke.name(), invoke.methodType(), invoke.arguments(), false);
                 }
                 case ExpressionNode.NewInstance newInstance -> {
                     type(newInstance.type(), " constructor owner");
                     methodType(newInstance.constructorType(), " constructor descriptor");
+                    arguments(INIT_NAME, newInstance.constructorType(), newInstance.arguments(), false);
                 }
                 case ExpressionNode.DynamicConstant dynamicConstant -> {
                     dynamicConstant(dynamicConstant.constant());
@@ -356,10 +392,102 @@ final class LinkageValidator
                     // The original handle signature is deliberately replaced with a target-accessible signature.
                 }
                 case ExpressionNode.LinkedMethodInvocation linked -> methodType(linked.method().type(), " linked method descriptor");
-                case ExpressionNode.InvokeDynamic invokeDynamic -> dynamicCallSite(invokeDynamic.callSite());
-                case ExpressionNode.SetVariable setVariable -> type(setVariable.variable().type(), " local ", setVariable.variable().name());
+                case ExpressionNode.InvokeDynamic invokeDynamic -> {
+                    DynamicCallSiteDesc callSite = invokeDynamic.callSite();
+                    dynamicCallSite(callSite);
+                    arguments(callSite.invocationName(), callSite.invocationType(), invokeDynamic.arguments(), erasesHiddenClass(callSite));
+                }
+                case ExpressionNode.SetVariable setVariable -> {
+                    type(setVariable.variable().type(), " local ", setVariable.variable().name());
+                    local(setVariable.variable(), setVariable.value());
+                }
                 case ExpressionNode.Increment increment -> type(increment.variable().type(), " local ", increment.variable().name());
             }
+        }
+
+        private void local(Variable variable, BytecodeExpression value)
+        {
+            if (rejects(variable.type(), value)) {
+                throw failure("value of type %s is not assignable to local %s of type %s".formatted(value.type().displayName(), variable.name(), variable.type().displayName()));
+            }
+        }
+
+        private void receiver(String member, ClassDesc owner, BytecodeExpression target)
+        {
+            if (rejects(owner, target)) {
+                throw failure("receiver of type %s for %s is not assignable to %s".formatted(target.type().displayName(), member, owner.displayName()));
+            }
+        }
+
+        private void arguments(String member, MethodTypeDesc type, List<BytecodeExpression> arguments, boolean erasesHiddenClass)
+        {
+            for (int index = 0; index < arguments.size(); index++) {
+                ClassDesc parameterType = type.parameterType(index);
+                if (!(erasesHiddenClass && HiddenClassLinkage.namesOwner(parameterType, definition.type())) && rejects(parameterType, arguments.get(index))) {
+                    throw failure("argument %s of type %s for %s is not assignable to parameter type %s"
+                            .formatted(index, arguments.get(index).type().displayName(), member, parameterType.displayName()));
+                }
+            }
+        }
+
+        /// Returns whether the verifier rejects the value where the target type is declared. Only a
+        /// value whose verifier type is its model type is checked, and a `null` constant is
+        /// assignable everywhere.
+        private boolean rejects(ClassDesc target, BytecodeExpression value)
+        {
+            ClassDesc source = value.type();
+            // These pairs always pass, so they skip the search for the value's verifier type.
+            if (target.isPrimitive() || source.isPrimitive() || target.equals(source) || target.equals(CD_Object)) {
+                return false;
+            }
+            return isExact(value, 0) && !linkage.isAssignable(target, source);
+        }
+
+        /// Returns whether the verifier's type for the value is its model type. A local's verifier
+        /// type is the type of the value last stored, which can differ from its declared type, so
+        /// a local is never exact.
+        private boolean isExact(BytecodeExpression expression, int depth)
+        {
+            if (depth > MAX_EXACT_DEPTH) {
+                return false;
+            }
+            return switch (expression) {
+                case LocalValue _ -> false;
+                case SyntheticExpression synthetic -> isExact(synthetic.expansion(ExpansionContext.INSTANCE).value(), depth + 1);
+                case CoreExpression core -> switch (core.node()) {
+                    case ExpressionNode.Constant constant -> constant.value() != null;
+                    // Boxing produces the wrapper type, not a wider declared cast type.
+                    case ExpressionNode.Cast cast -> !cast.value().type().isPrimitive() || cast.type().equals(DescriptorUtils.boxedType(cast.value().type()));
+                    case ExpressionNode.FieldGet _,
+                         ExpressionNode.Invoke _,
+                         ExpressionNode.NewInstance _,
+                         ExpressionNode.NewArray _,
+                         ExpressionNode.DynamicConstant _,
+                         ExpressionNode.BoundConstant _ -> true;
+                    case ExpressionNode.InvokeDynamic dynamic -> !(HiddenClassLinkage.namesOwner(dynamic.type(), definition.type()) && erasesHiddenClass(dynamic.callSite()));
+                    case ExpressionNode.InlineIf inlineIf -> isExact(inlineIf.ifTrue(), depth + 1) && isExact(inlineIf.ifFalse(), depth + 1);
+                    case ExpressionNode.ArrayGet arrayGet -> isExact(arrayGet.array(), depth + 1);
+                    // Bound and linked invocations adapt their signatures to the target.
+                    case ExpressionNode.BoundMethodHandleInvocation _,
+                         ExpressionNode.LinkedMethodInvocation _ -> false;
+                    case ExpressionNode.Binary _,
+                         ExpressionNode.Unary _,
+                         ExpressionNode.InstanceOf _,
+                         ExpressionNode.ArrayLength _,
+                         ExpressionNode.ArraySet _,
+                         ExpressionNode.FieldSet _,
+                         ExpressionNode.SetVariable _,
+                         ExpressionNode.Increment _,
+                         ExpressionNode.Adapter _ -> false;
+                };
+            };
+        }
+
+        /// Returns whether the emitter rewrites the call site for a hidden class, replacing each
+        /// type that names the hidden class itself with `Object`.
+        private boolean erasesHiddenClass(DynamicCallSiteDesc callSite)
+        {
+            return linkage.hiddenClass() && HiddenClassLinkage.rewrites(callSite, definition.type());
         }
 
         private void expressions(List<? extends BytecodeExpression> expressions, String segment)
