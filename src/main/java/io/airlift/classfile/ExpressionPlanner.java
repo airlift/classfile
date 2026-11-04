@@ -88,9 +88,11 @@ final class ExpressionPlanner
         private final ArrayList<String> names = new ArrayList<>();
         private final Set<HiddenClassLinkage.MethodReference> lambdaImplementations = new LinkedHashSet<>();
         private final Set<String> usedMethodNames;
+        private final ArrayDeque<BytecodeExpression> budgetPending = new ArrayDeque<>();
         private String logicalMethod;
         private Optional<Variable> logicalReceiver = Optional.empty();
         private int nextHelper;
+        private int remainingBudget;
 
         private Planner(ClassDesc owner, int expressionBudget, boolean hiddenClass, Set<String> usedMethodNames)
         {
@@ -102,7 +104,7 @@ final class ExpressionPlanner
 
         private MethodDefinition.Model method(MethodDefinition.Model method)
         {
-            if (!method.hasBody() || method.isClassInitializer()) {
+            if (!method.hasBody() || method.isClassInitializer() || fitsBudget(method.body())) {
                 return method;
             }
             logicalMethod = sanitize(method.name());
@@ -127,16 +129,117 @@ final class ExpressionPlanner
                     method.invisibleAnnotations());
         }
 
+        // Planning leaves a statement unchanged when it has no synthetic expression to snapshot
+        // and its whole estimate is within the budget, because then no expression in it can be
+        // extracted. Keep these costs in sync with the estimate methods. The scan records lambda
+        // implementations in planning order because fitting statements skip planning.
+        private boolean fitsBudget(Statement statement)
+        {
+            remainingBudget = expressionBudget;
+            return fits(statement);
+        }
+
+        private boolean fits(Statement statement)
+        {
+            return switch (statement) {
+                case BytecodeExpression expression -> fits(expression);
+                case Statements.Expression expression -> fits(expression.expression());
+                case Statements.InitializedDeclaration declaration -> consume(4) && fits(declaration.initializer());
+                case Statements.Declaration _,
+                     Statements.Comment _,
+                     Statements.LabelBinding _ -> true;
+                case CodeBlock block -> fits(block.statements());
+                case IfStatement value -> consume(12) && fits(value.condition()) && fits(value.ifTrue()) && fits(value.ifFalse());
+                case ForLoop value -> consume(16) && fits(value.initializer()) && fits(value.condition()) && fits(value.update()) && fits(value.body());
+                case WhileLoop value -> consume(12) && fits(value.condition()) && fits(value.body());
+                case DoWhileLoop value -> consume(12) && fits(value.condition()) && fits(value.body());
+                case SwitchStatement value -> {
+                    if (!consume(16) || !fits(value.expression())) {
+                        yield false;
+                    }
+                    for (SwitchStatement.Case caseValue : value.cases()) {
+                        if (!fits(caseValue.body())) {
+                            yield false;
+                        }
+                    }
+                    yield fits(value.defaultCase());
+                }
+                case TryCatch value -> {
+                    if (!consume(24) || !fits(value.tryBlock())) {
+                        yield false;
+                    }
+                    for (TryCatch.CatchClause catchClause : value.catches()) {
+                        if (!fits(catchClause.body())) {
+                            yield false;
+                        }
+                    }
+                    yield value.finallyBlock().isEmpty() || fits(value.finallyBlock().orElseThrow());
+                }
+                case LoopJump _,
+                     Statements.Jump _ -> consume(8);
+                case Statements.ConstructorInvocation invocation -> consume(8) && fits(invocation.arguments());
+            };
+        }
+
+        private boolean fits(List<? extends Statement> statements)
+        {
+            for (int index = 0; index < statements.size(); index++) {
+                if (!fits(statements.get(index))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private boolean fits(BytecodeExpression expression)
+        {
+            budgetPending.push(expression);
+            boolean fits = true;
+            while (fits && !budgetPending.isEmpty()) {
+                switch (budgetPending.pop()) {
+                    case LocalValue _ -> fits = consume(4);
+                    case SyntheticExpression _ -> fits = false;
+                    case CoreExpression core -> {
+                        ExpressionNode node = core.node();
+                        if (hiddenClass && node instanceof ExpressionNode.InvokeDynamic invokeDynamic) {
+                            HiddenClassLinkage.implementationMethod(invokeDynamic.callSite(), owner).ifPresent(lambdaImplementations::add);
+                        }
+                        fits = consume(8);
+                        if (fits) {
+                            List<BytecodeExpression> children = node.children();
+                            for (int index = children.size() - 1; index >= 0; index--) {
+                                budgetPending.push(children.get(index));
+                            }
+                        }
+                    }
+                }
+            }
+            budgetPending.clear();
+            return fits;
+        }
+
+        private boolean consume(int estimate)
+        {
+            remainingBudget -= estimate;
+            return remainingBudget >= 0;
+        }
+
         private CodeBlock block(CodeBlock block)
         {
-            boolean changed = false;
-            ArrayList<Statement> statements = new ArrayList<>(block.statements().size());
-            for (Statement statement : block.statements()) {
+            List<Statement> statements = block.statements();
+            ArrayList<Statement> rewrittenStatements = null;
+            for (int index = 0; index < statements.size(); index++) {
+                Statement statement = statements.get(index);
                 Statement rewritten = statement(statement);
-                statements.add(rewritten);
-                changed |= different(rewritten, statement);
+                if (rewrittenStatements == null && different(rewritten, statement)) {
+                    rewrittenStatements = new ArrayList<>(statements.size());
+                    rewrittenStatements.addAll(statements.subList(0, index));
+                }
+                if (rewrittenStatements != null) {
+                    rewrittenStatements.add(rewritten);
+                }
             }
-            return changed ? block.withStatements(statements) : block;
+            return rewrittenStatements == null ? block : block.withStatements(rewrittenStatements);
         }
 
         private Statement statement(Statement statement)
@@ -195,6 +298,9 @@ final class ExpressionPlanner
 
         private BytecodeExpression expression(BytecodeExpression expression, boolean conditional)
         {
+            if (fitsBudget(expression)) {
+                return expression;
+            }
             return planExpression(expression, conditional).expression();
         }
 
@@ -236,7 +342,7 @@ final class ExpressionPlanner
                 if (hiddenClass && node instanceof ExpressionNode.InvokeDynamic invokeDynamic) {
                     HiddenClassLinkage.implementationMethod(invokeDynamic.callSite(), owner).ifPresent(lambdaImplementations::add);
                 }
-                List<BytecodeExpression> children = node.children();
+                List<BytecodeExpression> children = frame.children;
                 if (frame.rewrittenChildren.size() < children.size()) {
                     BytecodeExpression child = children.get(frame.rewrittenChildren.size());
                     pending.push(new ExpressionFrame(child, conditionalChild(node, child)));
@@ -244,8 +350,13 @@ final class ExpressionPlanner
                 }
 
                 boolean childrenChanged = false;
+                int rewrittenEstimate = 8;
+                boolean setupConstrained = false;
                 for (int index = 0; index < children.size(); index++) {
-                    childrenChanged |= different(children.get(index), frame.rewrittenChildren.get(index).expression());
+                    PlannedExpression child = frame.rewrittenChildren.get(index);
+                    childrenChanged |= different(children.get(index), child.expression());
+                    rewrittenEstimate += child.estimate();
+                    setupConstrained |= child.setupConstrained();
                 }
                 ExpressionNode rewrittenNode = node;
                 if (childrenChanged) {
@@ -253,8 +364,6 @@ final class ExpressionPlanner
                     rewrittenNode = rewriteChildren(node, _ -> rewrittenChildren.next().expression());
                 }
                 BytecodeExpression rewritten = childrenChanged ? new CoreExpression(rewrittenNode) : frame.expression;
-                int rewrittenEstimate = 8 + frame.rewrittenChildren.stream().mapToInt(PlannedExpression::estimate).sum();
-                boolean setupConstrained = frame.rewrittenChildren.stream().anyMatch(PlannedExpression::setupConstrained);
                 if (!setupConstrained && isExtractionCandidate(rewrittenNode) && rewrittenEstimate > expressionBudget) {
                     rewritten = extract(rewritten, frame.conditional);
                     rewrittenEstimate = estimate(rewritten);
@@ -269,12 +378,15 @@ final class ExpressionPlanner
         {
             private final BytecodeExpression expression;
             private final boolean conditional;
-            private final ArrayList<PlannedExpression> rewrittenChildren = new ArrayList<>();
+            private final List<BytecodeExpression> children;
+            private final ArrayList<PlannedExpression> rewrittenChildren;
 
             private ExpressionFrame(BytecodeExpression expression, boolean conditional)
             {
                 this.expression = expression;
                 this.conditional = conditional;
+                this.children = expression instanceof CoreExpression core ? core.node().children() : List.of();
+                this.rewrittenChildren = new ArrayList<>(children.size());
             }
         }
 
@@ -445,7 +557,9 @@ final class ExpressionPlanner
                 }
                 case CoreExpression core -> {
                     estimate += 8;
-                    core.node().children().forEach(pending::push);
+                    for (BytecodeExpression child : core.node().children()) {
+                        pending.push(child);
+                    }
                 }
             }
         }
@@ -454,7 +568,11 @@ final class ExpressionPlanner
 
     static int estimate(CodeBlock block)
     {
-        return block.statements().stream().mapToInt(ExpressionPlanner::estimate).sum();
+        int estimate = 0;
+        for (Statement statement : block.statements()) {
+            estimate += estimate(statement);
+        }
+        return estimate;
     }
 
     static int estimate(Statement statement)
