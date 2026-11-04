@@ -341,14 +341,26 @@ class TestCompiledUnit
         }
         evaluate.body().ret(result);
 
+        // The output is still initialized inside the helper when an earlier statement does not touch it.
+        Parameter input = arg("input", int.class);
+        MethodDefinition evaluateAfterCall = definition.method("evaluateAfterCall", int.class, input).access(PUBLIC, STATIC);
+        Variable laterResult = evaluateAfterCall.body().declare(int.class, "result");
+        evaluateAfterCall.body().append(invokeStatic(Integer.class, "bitCount", int.class, input).pop());
+        for (int index = 1; index <= 100; index++) {
+            evaluateAfterCall.body().append(laterResult.set(constantInt(index)));
+        }
+        evaluateAfterCall.body().ret(laterResult);
+
         StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
         CompiledUnit unit = compilerWithSmallMethodLimit(definer.compilationTarget()).compileUnit(definition.build());
         assertThat(unit.report().classes().getFirst().methods())
                 .extracting(CompilationReport.MethodInfo::name)
-                .anyMatch(name -> name.startsWith("evaluate$statements$"));
+                .anyMatch(name -> name.startsWith("evaluate$statements$"))
+                .anyMatch(name -> name.startsWith("evaluateAfterCall$statements$"));
 
         Class<?> generated = definer.defineUnit(unit).primaryClass();
         assertThat(generated.getMethod("evaluate").invoke(null)).isEqualTo(100);
+        assertThat(generated.getMethod("evaluateAfterCall", int.class).invoke(null, 7)).isEqualTo(100);
     }
 
     @Test

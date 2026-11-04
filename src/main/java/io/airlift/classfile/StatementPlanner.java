@@ -814,8 +814,16 @@ final class StatementPlanner
         private Optional<Statement> extractRegion(MethodDefinition.Model method, List<Statement> region, Optional<Variable> output)
         {
             LinkedHashSet<LocalValue> locals = new LinkedHashSet<>();
-            region.forEach(statement -> locals.addAll(ExpressionPlanner.locals(statement)));
-            boolean initializesOutput = output.filter(variable -> initializesOutput(region.getFirst(), variable)).isPresent();
+            Statement firstOutputMention = null;
+            for (Statement statement : region) {
+                List<LocalValue> statementLocals = ExpressionPlanner.locals(statement);
+                if (firstOutputMention == null && output.filter(statementLocals::contains).isPresent()) {
+                    firstOutputMention = statement;
+                }
+                locals.addAll(statementLocals);
+            }
+            // The helper declares the output when the region assigns it before any other statement mentions it.
+            boolean initializesOutput = firstOutputMention != null && initializesOutput(firstOutputMention, output.orElseThrow());
             if (initializesOutput) {
                 locals.remove(output.orElseThrow());
             }
