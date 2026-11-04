@@ -349,6 +349,9 @@ result back to the original local:
 result = evaluate$statements$1(input, result);
 ```
 
+When the region assigns the local before any other statement mentions it, the helper
+declares the local itself and it is not passed in.
+
 Heap writes and calls do not need an explicit output because their effects are already
 visible to the caller.
 
