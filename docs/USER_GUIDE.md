@@ -936,6 +936,15 @@ Model validation rejects a setup that breaks them with a message naming the synt
 expression. Evaluate the synthetic expression first, for example into a variable, and
 use the variable as the operand.
 
+Linkage validation rejects a value of an unrelated reference type stored, passed, or
+returned where the verifier would reject it, and a catch type that is not a
+`Throwable`, naming the model path instead of a bytecode offset. It checks a value only
+when the value's type is known exactly, such as a constant, cast, field read, or call
+result. The model is built for well-typed code, so it does not support two patterns the
+verifier allows. A local holds only values assignable to its declared type, even a
+value that is never used as that type. Reference types must be assignable even in code
+the compiler folds away, such as a branch on a literal condition.
+
 Logical descriptions improve model dumps. Source-derived helper names make physical
 reports, disassembly, and production stack traces easier to interpret.
 
