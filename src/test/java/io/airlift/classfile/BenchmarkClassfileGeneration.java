@@ -81,6 +81,12 @@ public class BenchmarkClassfileGeneration
     }
 
     @Benchmark
+    public void validateModel(BenchmarkData data)
+    {
+        ModelValidator.validate(data.model);
+    }
+
+    @Benchmark
     public MethodHandles.Lookup defineCompiledClass(BenchmarkData data)
     {
         return data.definer.defineCompiledClass(data.compiledClass);
@@ -117,7 +123,7 @@ public class BenchmarkClassfileGeneration
     @State(Scope.Thread)
     public static class BenchmarkData
     {
-        @Param({"STATE_1", "STATE_5", "STATE_64", "STATE_512", "WIDE_NESTED_50", "DEEP_EXPRESSION_512"})
+        @Param({"STATE_1", "STATE_5", "STATE_64", "STATE_512", "WIDE_NESTED_50", "WIDE_SCOPE_512", "DEEP_EXPRESSION_512"})
         private Shape shape;
 
         private MethodHandles.Lookup lookup;
@@ -138,6 +144,7 @@ public class BenchmarkClassfileGeneration
             model = switch (shape) {
                 case STATE_1, STATE_5, STATE_64, STATE_512 -> stateModel(shape.fieldCount());
                 case WIDE_NESTED_50 -> wideNestedModel(50);
+                case WIDE_SCOPE_512 -> wideScopeModel(512);
                 case DEEP_EXPRESSION_512 -> deepExpressionModel(512);
             };
             compiledClass = compiler.compileClass(model);
@@ -152,6 +159,7 @@ public class BenchmarkClassfileGeneration
         STATE_64(64),
         STATE_512(512),
         WIDE_NESTED_50(0),
+        WIDE_SCOPE_512(0),
         DEEP_EXPRESSION_512(0);
 
         private final int fieldCount;
@@ -226,6 +234,26 @@ public class BenchmarkClassfileGeneration
             method.body().append(field.build());
         }
         method.body().ret(constantBoolean(true));
+        return definition.build();
+    }
+
+    private static ClassModel wideScopeModel(int localCount)
+    {
+        ClassDefinition definition = ClassDefinition.define(ClassDesc.of(BenchmarkClassfileGeneration.class.getPackageName() + ".GeneratedBenchmarkWideScope"))
+                .access(PUBLIC, FINAL);
+        definition.defaultConstructor().access(PUBLIC);
+
+        Parameter values = Parameter.arg("values", long[].class);
+        MethodDefinition method = definition.method("sumNonZero", long.class, values).access(PUBLIC, STATIC);
+        Variable sum = method.body().declare("sum", constantLong(0));
+        for (int index = 0; index < localCount; index++) {
+            Variable value = method.body().declare("value" + index, values.getElement(index));
+            method.body().append(IfStatement.builder()
+                    .condition(value.notEqual(constantLong(0)))
+                    .then(sum.set(sum.add(value)))
+                    .build());
+        }
+        method.body().append(sum.ret());
         return definition.build();
     }
 
