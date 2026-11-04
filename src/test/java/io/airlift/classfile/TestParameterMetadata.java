@@ -47,6 +47,7 @@ class TestParameterMetadata
     private static final AtomicLong NEXT_ID = new AtomicLong();
 
     @Test
+    @SuppressWarnings("NonRuntimeAnnotation") // Verifies the invisible annotation is not exposed by reflection.
     void testParameterNamesFlagsAndAnnotations()
             throws Exception
     {
