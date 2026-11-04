@@ -124,6 +124,14 @@ public final class CompilationTarget
         return typeResolver.resolveClass(requireNonNull(type, "type is null"));
     }
 
+    /// Returns whether the value is an instance of the type; a non-null value of an unresolved type
+    /// passes, deferring to the JVM.
+    boolean isInstance(Object value, ClassDesc type)
+    {
+        Optional<Class<?>> resolved = resolveClass(type);
+        return resolved.isEmpty() || resolved.orElseThrow().isInstance(value);
+    }
+
     void requireInstance(Object value, ClassDesc type, ClassDesc generatedType, String location)
     {
         requireNonNull(value, "value is null");
@@ -138,21 +146,22 @@ public final class CompilationTarget
         });
     }
 
-    void requireAccessible(ClassDesc type, ClassDesc generatedType, String location)
+    /// Returns why the generated type cannot access the type, or empty when it can.
+    Optional<String> accessProblem(ClassDesc type, ClassDesc generatedType)
     {
         requireNonNull(type, "type is null");
         if (type.isPrimitive()) {
-            return;
+            return Optional.empty();
         }
         if (type.isArray()) {
-            requireAccessible(type.componentType(), generatedType, location);
-            return;
+            return accessProblem(type.componentType(), generatedType);
         }
 
         Resolution resolution = typeResolver.resolve(type, generatedType);
-        if (!resolution.accessible()) {
-            throw linkageFailure(generatedType, location, type, resolution.problem());
+        if (resolution.accessible()) {
+            return Optional.empty();
         }
+        return Optional.of("type %s is not accessible from %s: %s".formatted(type.displayName(), description, resolution.problem()));
     }
 
     AdaptedMethodHandle adapt(MethodHandle handle, List<ClassDesc> argumentTypes, ClassDesc generatedType, String location)
@@ -191,12 +200,6 @@ public final class CompilationTarget
         return typeResolver.isAccessible(type, generatedType) ? type : Object.class;
     }
 
-    private CompilationException linkageFailure(ClassDesc generatedType, String location, ClassDesc type, String problem)
-    {
-        return new CompilationException("Linkage validation failed for %s:%n  %s%n  type %s is not accessible from %s: %s"
-                .formatted(generatedType.displayName(), location, type.displayName(), description, problem));
-    }
-
     private static String identity(Object value)
     {
         if (value == null) {
@@ -233,10 +236,7 @@ public final class CompilationTarget
 
     private record Resolution(boolean accessible, String problem)
     {
-        private static Resolution accessibleResolution()
-        {
-            return new Resolution(true, "");
-        }
+        private static final Resolution ACCESSIBLE = new Resolution(true, "");
 
         private static Resolution inaccessible(String problem)
         {
@@ -258,7 +258,7 @@ public final class CompilationTarget
                 return Resolution.inaccessible("the target cannot resolve the class (" + e + ")");
             }
             return isAccessible(resolved, generatedType)
-                    ? Resolution.accessibleResolution()
+                    ? Resolution.ACCESSIBLE
                     : Resolution.inaccessible("resolved to " + identity(resolved.getClassLoader()) + " but the class is not accessible from the generated runtime package");
         }
 
@@ -310,7 +310,7 @@ public final class CompilationTarget
             try {
                 Class<?> resolved = type.resolveConstantDesc(lookup);
                 lookup.accessClass(resolved);
-                return Resolution.accessibleResolution();
+                return Resolution.ACCESSIBLE;
             }
             catch (ReflectiveOperationException | IllegalArgumentException | LinkageError e) {
                 return Resolution.inaccessible("the target lookup cannot access the class (" + e + ")");

@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -177,24 +178,35 @@ final class LinkageContext
                 .anyMatch(constructor -> DescriptorUtils.methodType(constructor).equals(constructorType) && Modifier.isPublic(constructor.getModifiers()));
     }
 
-    void requireAccessible(ClassDesc type, ClassModel definition, String location)
+    /// Returns why the definition cannot access the type, or empty when it can.
+    Optional<String> accessProblem(ClassDesc type, ClassModel definition)
     {
         if (type.isArray()) {
-            requireAccessible(type.componentType(), definition, location);
-            return;
+            return accessProblem(type.componentType(), definition);
         }
         ClassModel generatedDefinition = generatedDefinitions.get(type);
         if (generatedDefinition == null) {
-            target.requireAccessible(type, definition.type(), location);
-            return;
+            return target.accessProblem(type, definition.type());
         }
         if (same(generatedDefinition, definition) ||
                 generatedDefinition.access().contains(PUBLIC) ||
                 generatedDefinition.type().packageName().equals(definition.type().packageName())) {
-            return;
+            return Optional.empty();
         }
-        throw new CompilationException("Linkage validation failed for %s:%n  %s%n  generated type %s is package-private and declared in a different package"
-                .formatted(definition.type().displayName(), location, type.displayName()));
+        return Optional.of("generated type %s is package-private and declared in a different package".formatted(type.displayName()));
+    }
+
+    private void requireAccessible(ClassDesc type, ClassModel definition, String location)
+    {
+        Optional<String> problem = accessProblem(type, definition);
+        if (problem.isPresent()) {
+            throw linkageFailure(definition, location, problem.orElseThrow());
+        }
+    }
+
+    static CompilationException linkageFailure(ClassModel definition, String location, String problem)
+    {
+        return new CompilationException("Linkage validation failed for %s:%n  %s%n  %s".formatted(definition.type().displayName(), location, problem));
     }
 
     void requireInterface(ClassDesc type, ClassModel definition, String location)
@@ -204,6 +216,13 @@ final class LinkageContext
             throw new CompilationException("Linkage validation failed for %s:%n  %s%n  type %s is not an interface"
                     .formatted(definition.type().displayName(), location, type.displayName()));
         }
+    }
+
+    /// Returns whether the value is an instance of the type; a type generated in this unit never
+    /// matches, and a non-null value of another unresolved type passes, deferring to the JVM.
+    boolean isInstance(Object value, ClassDesc type)
+    {
+        return !generatedDefinitions.containsKey(RuntimeDataRequirements.componentType(type)) && target.isInstance(value, type);
     }
 
     void requireInstance(Object value, ClassDesc type, ClassModel definition, String location)
