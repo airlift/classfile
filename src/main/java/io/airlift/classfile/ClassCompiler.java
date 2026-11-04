@@ -1493,7 +1493,7 @@ public final class ClassCompiler
         return true;
     }
 
-    private static boolean isNullConstant(BytecodeExpression expression)
+    static boolean isNullConstant(BytecodeExpression expression)
     {
         return expression instanceof CoreExpression core &&
                 core.node() instanceof ExpressionNode.Constant constant &&

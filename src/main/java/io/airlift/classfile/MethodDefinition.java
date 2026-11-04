@@ -372,17 +372,26 @@ public final class MethodDefinition
             if (isClassInitializer()) {
                 return "static " + body();
             }
+            String prefix = comment.map(value -> "// " + value + "\n").orElse("");
+            return prefix + declaration() + (hasBody() ? " " + body() : ";");
+        }
+
+        /// Returns the method's declaration without its body, or `class initializer` for a class
+        /// initializer, naming the method in messages.
+        String declaration()
+        {
+            if (isClassInitializer()) {
+                return "class initializer";
+            }
             String parameterList = parameters.stream()
                     .map(parameter -> parameter.type().displayName() + " " + parameter.name())
                     .collect(joining(", "));
             String exceptions = this.exceptions.isEmpty() ? "" : this.exceptions.stream()
                                                                  .map(ClassDesc::displayName)
                                                                  .collect(joining(", ", " throws ", ""));
-            String declaration = ModelRendering.access(access) +
+            return ModelRendering.access(access) +
                     (isConstructor() ? declaringType.displayName() : returnType().displayName() + " " + name) +
                     "(" + parameterList + ")" + exceptions;
-            String prefix = comment.map(value -> "// " + value + "\n").orElse("");
-            return prefix + declaration + (hasBody() ? " " + body() : ";");
         }
     }
 }

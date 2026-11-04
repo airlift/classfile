@@ -19,6 +19,7 @@ import java.lang.constant.MethodTypeDesc;
 import java.lang.reflect.AccessFlag;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -1007,27 +1008,103 @@ final class ModelValidator
                 (isNarrowInteger(target) && isNarrowInteger(source));
     }
 
+    private static boolean isLogical(ExpressionNode.Binary binary)
+    {
+        return binary.operator().equals("&&") || binary.operator().equals("||");
+    }
+
+    // Conservatively, whether the end of a block can be reached: false only when its last statement
+    // throws, returns, or jumps, or is a block or if statement whose blocks all end so. A label is
+    // bound in its own block, so every label of such a block and of the blocks enclosing it precedes
+    // the last statement. A handler block in a stacked setup cannot jump to code outside itself.
+    private static boolean canCompleteNormally(CodeBlock block)
+    {
+        List<Statement> statements = block.statements();
+        if (statements.isEmpty()) {
+            return true;
+        }
+        return switch (statements.getLast()) {
+            case CoreExpression core -> !isReturnOrThrow(core.node());
+            case Statements.Expression expression -> !(expression.expression() instanceof CoreExpression core && isReturnOrThrow(core.node()));
+            case Statements.Jump _, LoopJump _ -> false;
+            case CodeBlock nested -> canCompleteNormally(nested);
+            case IfStatement ifStatement -> canCompleteNormally(ifStatement.ifTrue()) || canCompleteNormally(ifStatement.ifFalse());
+            default -> true;
+        };
+    }
+
+    private static boolean isReturnOrThrow(ExpressionNode node)
+    {
+        return isReturn(node) || (node instanceof ExpressionNode.Adapter adapter && adapter.keyword().equals("throw"));
+    }
+
+    private static boolean isReturn(ExpressionNode node)
+    {
+        return switch (node) {
+            case ExpressionNode.Adapter adapter -> adapter.keyword().equals("return");
+            case ExpressionNode.Constant constant -> constant.type().equals(CD_void) && constant.value() == null;
+            default -> false;
+        };
+    }
+
     // Checks local, label, and loop scoping of method bodies in one walk, sharing one set of each
     // kind across nested scopes and undoing a scope's additions when it ends. The walk also detects
-    // block cycles and notes a return that disagrees with the method type.
+    // block cycles, notes a return that disagrees with the method type, and rejects synthetic setup
+    // code that the emitter cannot place above operands already on the operand stack.
     private static final class ScopeValidator
     {
-        private final ScopedSet<LocalValue> visible = new ScopedSet<>();
-        private final ScopedSet<CodeLabel> visibleLabels = new ScopedSet<>();
-        private final ScopedSet<Object> activeLoops = new ScopedSet<>();
+        // Labels and loops keep their positions in the order of additions for the jump checks; locals
+        // need only membership.
+        private final ScopedSet<LocalValue> visible = new ScopedSet<>(false);
+        private final ScopedSet<CodeLabel> visibleLabels = new ScopedSet<>(true);
+        private final ScopedSet<Object> activeLoops = new ScopedSet<>(true);
         private final Set<CodeBlock> activeBlocks = identitySet();
         private final Set<SyntheticExpression> activeExpressions = identitySet();
+        // Expression stack without a per-node entry object: each expression or synthetic exit marker,
+        // whether operands of the same statement are already on the operand stack beneath it, and
+        // whether the emitter branches on it as a condition instead of pushing its value.
         // Shared with walks nested through synthetic setup blocks, so each walk pops only to its own base.
-        private final ArrayDeque<Object> pending = new ArrayDeque<>();
+        private Object[] pendingExpressions = new Object[32];
+        private boolean[] pendingStacked = new boolean[32];
+        private boolean[] pendingConditions = new boolean[32];
+        private int pendingCount;
         // Labels bound so far in the current block, allocated at the first binding.
         private Set<CodeLabel> boundLabels = Set.of();
+        private MethodDefinition.Model method;
         private ClassDesc returnType;
         // Match validateReturns by skipping return checks in constructor arguments.
         private int constructorArgumentDepth;
         private boolean returnMismatch;
+        // Synthetic setups entered with operands on the stack. Their code runs above those operands,
+        // so it must not rejoin code that runs at another stack depth. The innermost such synthetic
+        // and the label and loop marks taken when its setup was entered describe the current level;
+        // inside a finally or catch block of that setup, the marks are taken when the block was entered,
+        // and the jump description names the block.
+        private int stackedLevel;
+        private SyntheticExpression stackedSynthetic;
+        private int stackedLabelMark;
+        private int stackedLoopMark;
+        private String stackedJumpOut;
+        // Whether the current code runs above operands already on the operand stack: true in a stacked
+        // setup and in a finally block that a return from one runs, and false in a catch block, as an
+        // exception handler starts on an empty operand stack.
+        private boolean operandsBelow;
+        // Finally blocks of the try statements enclosing the current statement, with the stacked level
+        // of each try statement and the first stacked synthetic whose setup returns through it.
+        private int[] finallyLevels = new int[4];
+        private SyntheticExpression[] finallyReturns = new SyntheticExpression[4];
+        private int finallyCount;
+        // The stacked synthetic whose setup returns through the finally block being validated, which
+        // makes a copy of that block run above the operands, the label and loop marks taken when the
+        // innermost handler block in it was entered, and how a jump leaves that handler block.
+        private SyntheticExpression stackedFinallyReturn;
+        private int stackedFinallyLabelMark;
+        private int stackedFinallyLoopMark;
+        private String stackedFinallyJumpOut;
 
         private boolean validate(MethodDefinition.Model method)
         {
+            this.method = method;
             returnType = method.returnType();
             returnMismatch = false;
             List<Parameter> parameters = method.parameters();
@@ -1082,7 +1159,8 @@ final class ModelValidator
                     constructorArgumentDepth++;
                     List<BytecodeExpression> arguments = invocation.arguments();
                     for (int index = 0; index < arguments.size(); index++) {
-                        validateExpression(arguments.get(index));
+                        // The receiver is loaded before the arguments.
+                        validateExpression(arguments.get(index), true, false);
                     }
                     constructorArgumentDepth--;
                 }
@@ -1101,6 +1179,12 @@ final class ModelValidator
                     if (!visibleLabels.contains(jump.target())) {
                         throw new IllegalArgumentException("Label is not in scope: " + jump.target().name());
                     }
+                    if (stackedLevel > 0 && !visibleLabels.addedSince(jump.target(), stackedLabelMark)) {
+                        throw stackedJumpException(" to label " + jump.target().name());
+                    }
+                    if (stackedFinallyReturn != null && !visibleLabels.addedSince(jump.target(), stackedFinallyLabelMark)) {
+                        throw stackedFinallyJumpException(" to label " + jump.target().name());
+                    }
                 }
                 case Statements.Declaration declaration -> {
                     if (different(declaration.variable().owner(), currentBlock.scope())) {
@@ -1117,14 +1201,14 @@ final class ModelValidator
                 }
                 case CodeBlock block -> validateBlock(block, false);
                 case IfStatement ifStatement -> {
-                    validateExpression(ifStatement.condition());
+                    validateCondition(ifStatement.condition());
                     validateBlock(ifStatement.ifTrue(), false);
                     validateBlock(ifStatement.ifFalse(), false);
                 }
                 case ForLoop forLoop -> {
                     int visibleMark = visible.mark();
                     validateBlock(forLoop.initializer(), true);
-                    validateExpression(forLoop.condition());
+                    validateCondition(forLoop.condition());
                     int loopMark = activeLoops.mark();
                     activeLoops.add(forLoop.target());
                     validateBlock(forLoop.body(), false);
@@ -1133,7 +1217,7 @@ final class ModelValidator
                     visible.restore(visibleMark);
                 }
                 case WhileLoop whileLoop -> {
-                    validateExpression(whileLoop.condition());
+                    validateCondition(whileLoop.condition());
                     int loopMark = activeLoops.mark();
                     activeLoops.add(whileLoop.target());
                     validateBlock(whileLoop.body(), false);
@@ -1144,11 +1228,17 @@ final class ModelValidator
                     activeLoops.add(doWhileLoop.target());
                     validateBlock(doWhileLoop.body(), false);
                     activeLoops.restore(loopMark);
-                    validateExpression(doWhileLoop.condition());
+                    validateCondition(doWhileLoop.condition());
                 }
                 case LoopJump jump -> {
                     if (!activeLoops.contains(jump.target())) {
                         throw new IllegalArgumentException("Loop jump is outside its target loop");
+                    }
+                    if (stackedLevel > 0 && !activeLoops.addedSince(jump.target(), stackedLoopMark)) {
+                        throw stackedJumpException("");
+                    }
+                    if (stackedFinallyReturn != null && !activeLoops.addedSince(jump.target(), stackedFinallyLoopMark)) {
+                        throw stackedFinallyJumpException("");
                     }
                 }
                 case SwitchStatement switchStatement -> {
@@ -1159,28 +1249,155 @@ final class ModelValidator
                     validateBlock(switchStatement.defaultCase(), false);
                 }
                 case TryCatch tryCatch -> {
+                    // A handler starts with an empty operand stack and rejoins the code after the statement
+                    // unless its body cannot complete normally.
+                    if (operandsBelow) {
+                        for (TryCatch.CatchClause catchClause : tryCatch.catches()) {
+                            if (canCompleteNormally(catchClause.body())) {
+                                throw stackedLevel > 0 ? stackedCatchException() : stackedFinallyCatchException();
+                            }
+                        }
+                    }
+                    boolean hasFinally = tryCatch.finallyBlock().isPresent();
+                    if (hasFinally) {
+                        enterFinally();
+                    }
                     validateBlock(tryCatch.tryBlock(), false);
                     for (TryCatch.CatchClause catchClause : tryCatch.catches()) {
                         int visibleMark = visible.mark();
                         visible.add(catchClause.variable());
-                        validateBlock(catchClause.body(), false);
+                        validateHandlerBlock(catchClause.body(), "out of a catch block", "out of a catch block in it", stackedFinallyReturn, false);
                         visible.restore(visibleMark);
                     }
-                    if (tryCatch.finallyBlock().isPresent()) {
-                        validateBlock(tryCatch.finallyBlock().orElseThrow(), false);
+                    if (hasFinally) {
+                        SyntheticExpression stackedReturn = exitFinally();
+                        validateHandlerBlock(tryCatch.finallyBlock().orElseThrow(), "out of a finally block", "out of itself", stackedReturn, operandsBelow || stackedReturn != null);
                     }
                 }
             }
         }
 
+        private void enterFinally()
+        {
+            if (finallyCount == finallyLevels.length) {
+                finallyLevels = Arrays.copyOf(finallyLevels, finallyCount * 2);
+                finallyReturns = Arrays.copyOf(finallyReturns, finallyCount * 2);
+            }
+            finallyLevels[finallyCount] = stackedLevel;
+            finallyReturns[finallyCount] = null;
+            finallyCount++;
+        }
+
+        // Returns the stacked synthetic whose setup returns through the finally block, or null.
+        private SyntheticExpression exitFinally()
+        {
+            finallyCount--;
+            SyntheticExpression stackedReturn = finallyReturns[finallyCount];
+            finallyReturns[finallyCount] = null;
+            return stackedReturn;
+        }
+
+        // Validates a catch block or a finally block, given the stacked synthetic whose setup returns
+        // through the block's copy: for a finally block, its own, and for a catch block, that of the
+        // finally block enclosing it. A catch block runs on an empty operand stack, while a finally
+        // block also runs where its try statement completes and where a return runs it.
+        private void validateHandlerBlock(CodeBlock block, String jumpOut, String finallyJumpOut, SyntheticExpression stackedReturn, boolean blockOperandsBelow)
+        {
+            boolean enclosingOperandsBelow = operandsBelow;
+            operandsBelow = blockOperandsBelow;
+            if (stackedLevel == 0 && stackedReturn == null) {
+                validateBlock(block, false);
+                operandsBelow = enclosingOperandsBelow;
+                return;
+            }
+            int enclosingLabelMark = stackedLabelMark;
+            int enclosingLoopMark = stackedLoopMark;
+            String enclosingJumpOut = stackedJumpOut;
+            SyntheticExpression enclosingReturn = stackedFinallyReturn;
+            int enclosingFinallyLabelMark = stackedFinallyLabelMark;
+            int enclosingFinallyLoopMark = stackedFinallyLoopMark;
+            String enclosingFinallyJumpOut = stackedFinallyJumpOut;
+            // Inside a stacked setup, a handler runs this block on an empty operand stack, so the
+            // block must not jump to code outside itself.
+            if (stackedLevel > 0) {
+                stackedLabelMark = visibleLabels.mark();
+                stackedLoopMark = activeLoops.mark();
+                stackedJumpOut = jumpOut;
+            }
+            // A return inlines a copy of a finally block above the operands, so the copy must not
+            // jump to code outside itself, and a catch block in the copy must not jump outside its
+            // own block either. Inside an enclosing such block, this one's marks are the stricter.
+            if (stackedReturn != null) {
+                stackedFinallyReturn = stackedReturn;
+                stackedFinallyLabelMark = visibleLabels.mark();
+                stackedFinallyLoopMark = activeLoops.mark();
+                stackedFinallyJumpOut = finallyJumpOut;
+            }
+            validateBlock(block, false);
+            operandsBelow = enclosingOperandsBelow;
+            stackedLabelMark = enclosingLabelMark;
+            stackedLoopMark = enclosingLoopMark;
+            stackedJumpOut = enclosingJumpOut;
+            stackedFinallyReturn = enclosingReturn;
+            stackedFinallyLabelMark = enclosingFinallyLabelMark;
+            stackedFinallyLoopMark = enclosingFinallyLoopMark;
+            stackedFinallyJumpOut = enclosingFinallyJumpOut;
+        }
+
+        // Notes a return in a stacked synthetic setup on each enclosing finally block outside that
+        // setup, as the return runs a copy of each of them above the operands.
+        private void noteStackedReturn()
+        {
+            for (int index = 0; index < finallyCount; index++) {
+                if (finallyLevels[index] < stackedLevel && finallyReturns[index] == null) {
+                    finallyReturns[index] = stackedSynthetic;
+                }
+            }
+        }
+
+        private IllegalArgumentException stackedCatchException()
+        {
+            return new IllegalArgumentException("Synthetic expression setup cannot have a catch block that may complete normally while operands are on the stack: %s in %s"
+                    .formatted(stackedSynthetic, method.declaration()));
+        }
+
+        private IllegalArgumentException stackedJumpException(String target)
+        {
+            return new IllegalArgumentException("Synthetic expression setup cannot jump %s%s while operands are on the stack: %s in %s"
+                    .formatted(stackedJumpOut, target, stackedSynthetic, method.declaration()));
+        }
+
+        private IllegalArgumentException stackedFinallyCatchException()
+        {
+            return new IllegalArgumentException(
+                    "Synthetic expression setup cannot return through a finally block with a catch block that may complete normally while operands are on the stack: %s in %s"
+                            .formatted(stackedFinallyReturn, method.declaration()));
+        }
+
+        private IllegalArgumentException stackedFinallyJumpException(String target)
+        {
+            return new IllegalArgumentException(
+                    "Synthetic expression setup cannot return through a finally block that jumps %s%s while operands are on the stack: %s in %s"
+                            .formatted(stackedFinallyJumpOut, target, stackedFinallyReturn, method.declaration()));
+        }
+
         private void validateExpression(BytecodeExpression expression)
+        {
+            validateExpression(expression, false, false);
+        }
+
+        private void validateExpression(BytecodeExpression expression, boolean stacked, boolean condition)
         {
             record SyntheticExit(SyntheticExpression expression, int visibleMark) {}
 
-            int base = pending.size();
-            pending.push(expression);
-            while (pending.size() > base) {
-                Object item = pending.pop();
+            int base = pendingCount;
+            push(expression, stacked, condition);
+            while (pendingCount > base) {
+                pendingCount--;
+                Object item = pendingExpressions[pendingCount];
+                pendingExpressions[pendingCount] = null;
+                boolean itemStacked = pendingStacked[pendingCount];
+                boolean itemCondition = pendingConditions[pendingCount];
                 if (item instanceof SyntheticExit exit) {
                     activeExpressions.remove(exit.expression());
                     visible.restore(exit.visibleMark());
@@ -1194,13 +1411,16 @@ final class ModelValidator
                         }
                     }
                     case CoreExpression core -> {
-                        if (constructorArgumentDepth == 0 && !isValidReturnNode(core.node(), returnType)) {
+                        ExpressionNode node = core.node();
+                        if (constructorArgumentDepth == 0 && !isValidReturnNode(node, returnType)) {
                             returnMismatch = true;
                         }
-                        List<BytecodeExpression> children = core.node().children();
-                        for (int index = children.size() - 1; index >= 0; index--) {
-                            pending.push(children.get(index));
+                        // A return from a catch block runs on the handler's empty operand stack, so only a
+                        // return above the operands runs the enclosing finally copies above them.
+                        if (operandsBelow && stackedLevel > 0 && isReturn(node)) {
+                            noteStackedReturn();
                         }
+                        pushChildren(node, itemStacked, itemCondition);
                     }
                     case SyntheticExpression synthetic -> {
                         if (!activeExpressions.add(synthetic)) {
@@ -1216,30 +1436,158 @@ final class ModelValidator
                         }
                         // Setup declarations stay visible to the value until the expansion exits.
                         int visibleMark = visible.mark();
-                        validateBlock(plan.setup(), true);
-                        pending.push(new SyntheticExit(synthetic, visibleMark));
-                        pending.push(plan.value());
+                        if (itemStacked) {
+                            validateStackedSetup(synthetic, plan.setup());
+                        }
+                        else {
+                            validateBlock(plan.setup(), true);
+                        }
+                        // The emitter pushes a synthetic's value even where it branches on the synthetic.
+                        push(new SyntheticExit(synthetic, visibleMark), false, false);
+                        push(plan.value(), itemStacked, false);
                     }
                 }
             }
+        }
+
+        private void validateCondition(BytecodeExpression condition)
+        {
+            validateExpression(condition, false, true);
+        }
+
+        private void validateStackedSetup(SyntheticExpression synthetic, CodeBlock setup)
+        {
+            SyntheticExpression enclosingSynthetic = stackedSynthetic;
+            int enclosingLabelMark = stackedLabelMark;
+            int enclosingLoopMark = stackedLoopMark;
+            String enclosingJumpOut = stackedJumpOut;
+            boolean enclosingOperandsBelow = operandsBelow;
+            stackedLevel++;
+            stackedSynthetic = synthetic;
+            stackedLabelMark = visibleLabels.mark();
+            stackedLoopMark = activeLoops.mark();
+            stackedJumpOut = "outside itself";
+            operandsBelow = true;
+            validateBlock(setup, true);
+            stackedLevel--;
+            stackedSynthetic = enclosingSynthetic;
+            stackedLabelMark = enclosingLabelMark;
+            stackedLoopMark = enclosingLoopMark;
+            stackedJumpOut = enclosingJumpOut;
+            operandsBelow = enclosingOperandsBelow;
+        }
+
+        // Follows the emitter's evaluation order: a child is stacked when the code the emitter places
+        // before it leaves a value on the operand stack. A child is a condition when the emitter
+        // branches on it instead of pushing its value, as it does through the negations and short
+        // circuits of a condition.
+        private void pushChildren(ExpressionNode node, boolean stacked, boolean condition)
+        {
+            boolean firstStacked = stacked;
+            boolean laterStacked = true;
+            boolean firstCondition = false;
+            boolean laterCondition = false;
+            switch (node) {
+                // Short circuits branch on each value before evaluating the next one.
+                case ExpressionNode.Binary binary when isLogical(binary) -> {
+                    laterStacked = stacked;
+                    firstCondition = condition;
+                    laterCondition = condition;
+                }
+                // A branch on a null comparison pushes only the other value, but a comparison used
+                // as a value pushes both.
+                case ExpressionNode.Binary binary when condition && isNullComparison(binary) -> laterStacked = stacked;
+                case ExpressionNode.Unary unary when unary.prefix().equals("!") -> firstCondition = condition;
+                // A conditional branches on its condition before evaluating either value.
+                case ExpressionNode.InlineIf _ -> {
+                    laterStacked = stacked;
+                    firstCondition = true;
+                }
+                // An assignment evaluates only its value.
+                case ExpressionNode.SetVariable _ -> laterStacked = stacked;
+                // The new instance, the linked method handle, or the array and its index come first.
+                case ExpressionNode.NewInstance _, ExpressionNode.LinkedMethodInvocation _ -> firstStacked = true;
+                case ExpressionNode.NewArray newArray when newArray.length() == null -> firstStacked = true;
+                default -> {}
+            }
+            List<BytecodeExpression> children = node.children();
+            for (int index = children.size() - 1; index >= 0; index--) {
+                push(children.get(index), index == 0 ? firstStacked : laterStacked, index == 0 ? firstCondition : laterCondition);
+            }
+        }
+
+        private void push(Object item, boolean stacked, boolean condition)
+        {
+            if (pendingCount == pendingExpressions.length) {
+                pendingExpressions = Arrays.copyOf(pendingExpressions, pendingCount * 2);
+                pendingStacked = Arrays.copyOf(pendingStacked, pendingCount * 2);
+                pendingConditions = Arrays.copyOf(pendingConditions, pendingCount * 2);
+            }
+            pendingExpressions[pendingCount] = item;
+            pendingStacked[pendingCount] = stacked;
+            pendingConditions[pendingCount] = condition;
+            pendingCount++;
+        }
+
+        private static boolean isNullComparison(ExpressionNode.Binary binary)
+        {
+            return ClassCompiler.isNullConstant(binary.left()) || ClassCompiler.isNullConstant(binary.right());
         }
     }
 
     private static final class ScopedSet<T>
     {
-        private final Set<T> elements = identitySet();
+        // Boxed from the integer cache.
+        private static final int NO_POSITION = -1;
+
+        // Each element with its position in the order of additions, when the set tracks positions;
+        // a position beyond the integer cache is boxed.
+        private final Map<T, Integer> elements = new IdentityHashMap<>();
         private final List<T> added = new ArrayList<>();
+        private final boolean positioned;
+        // Elements a nested scope added again, such as the labels of another placement of a block,
+        // by their index in the additions, with the position each had in the enclosing scope.
+        private int[] readdedIndexes = new int[0];
+        private Integer[] enclosingPositions = new Integer[0];
+        private int readdedCount;
+
+        private ScopedSet(boolean positioned)
+        {
+            this.positioned = positioned;
+        }
 
         private void add(T element)
         {
-            if (elements.add(element)) {
-                added.add(element);
+            if (!positioned) {
+                if (elements.putIfAbsent(element, NO_POSITION) == null) {
+                    added.add(element);
+                }
+                return;
             }
+            // An element added again takes the new position until the nested scope ends.
+            Integer enclosingPosition = elements.put(element, added.size());
+            if (enclosingPosition != null) {
+                if (readdedCount == readdedIndexes.length) {
+                    readdedIndexes = Arrays.copyOf(readdedIndexes, Math.max(4, readdedCount * 2));
+                    enclosingPositions = Arrays.copyOf(enclosingPositions, readdedIndexes.length);
+                }
+                readdedIndexes[readdedCount] = added.size();
+                enclosingPositions[readdedCount] = enclosingPosition;
+                readdedCount++;
+            }
+            added.add(element);
         }
 
         private boolean contains(T element)
         {
-            return elements.contains(element);
+            return elements.containsKey(element);
+        }
+
+        // Whether the element was added at or after the mark; the set must track positions.
+        private boolean addedSince(T element, int mark)
+        {
+            Integer position = elements.get(element);
+            return position != null && position >= mark;
         }
 
         private int mark()
@@ -1250,7 +1598,15 @@ final class ModelValidator
         private void restore(int mark)
         {
             while (added.size() > mark) {
-                elements.remove(added.removeLast());
+                T element = added.removeLast();
+                if (readdedCount > 0 && readdedIndexes[readdedCount - 1] == added.size()) {
+                    readdedCount--;
+                    elements.put(element, enclosingPositions[readdedCount]);
+                    enclosingPositions[readdedCount] = null;
+                }
+                else {
+                    elements.remove(element);
+                }
             }
         }
     }

@@ -20,14 +20,17 @@ import java.lang.constant.ClassDesc;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.BytecodeExpressions.constantFalse;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantLong;
 import static io.airlift.classfile.BytecodeExpressions.constantNull;
+import static io.airlift.classfile.BytecodeExpressions.constantString;
 import static io.airlift.classfile.BytecodeExpressions.constantTrue;
 import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
 import static io.airlift.classfile.BytecodeExpressions.newArray;
@@ -293,6 +296,267 @@ class TestSyntheticExpressions
         assertThat(generated.getMethod("value").invoke(null)).isEqualTo(7);
     }
 
+    @Test
+    void testSetupWithOperandsOnStackStaysWithinItself()
+            throws Exception
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("StackedSetup")).access(PUBLIC, FINAL);
+        Parameter input = Parameter.arg("input", String.class);
+        Parameter count = Parameter.arg("count", int.class);
+        MethodDefinition method = definition.method("value", int.class, input, count).access(PUBLIC, STATIC);
+
+        // The first operand is evaluated on an empty operand stack, so its setup may catch exceptions.
+        CodeBlock.Builder parseSetup = CodeBlock.blockBuilder();
+        Variable parsed = parseSetup.declare(CD_int, "parsed");
+        parseSetup.append(TryCatch.builder()
+                .tryBlock(parsed.set(invokeStatic(Integer.class, "parseInt", int.class, input)))
+                .catching(NumberFormatException.class, "e", (body, _) -> body.append(parsed.set(constantInt(-1))))
+                .build());
+
+        // The second operand's setup runs above the first operand: it may branch within itself and return.
+        CodeBlock.Builder sumSetup = CodeBlock.blockBuilder();
+        Variable sum = sumSetup.declare("sum", constantInt(0));
+        Variable index = sumSetup.declare("index", constantInt(0));
+        WhileLoop.Builder loop = WhileLoop.builder();
+        sumSetup.append(IfStatement.builder().condition(count.lessThan(constantInt(0))).then(constantInt(-100).ret()).build())
+                .append(loop.condition(constantTrue())
+                        .body(CodeBlock.block(
+                                IfStatement.builder().condition(index.greaterThanOrEqual(count)).then(loop.breakLoop()).build(),
+                                sum.set(sum.add(index)),
+                                index.increment()))
+                        .build());
+
+        // A branch on a null comparison evaluates only the other operand.
+        method.body().append(IfStatement.builder()
+                .condition(count.equal(constantInt(-2)).or(constantNull(String.class).equal(new SetupThen(CodeBlock.block(catchingParse()), input))))
+                .then(constantInt(-200).ret())
+                .build());
+        method.body().ret(new SetupThen(parseSetup.build(), parsed).add(new SetupThen(sumSetup.build(), sum)));
+
+        // A handler that cannot complete normally never resumes the code above the operands.
+        BytecodeExpression bad = BytecodeExpressions.newInstance(IllegalArgumentException.class, constantString("bad")).throwObject();
+        Parameter throwingInput = Parameter.arg("input", String.class);
+        definition.method("throwing", int.class, throwingInput).access(PUBLIC, STATIC).body()
+                .ret(invokeStatic(Math.class, "addExact", int.class, constantInt(1), parseOr(throwingInput, bad)));
+        Parameter returningInput = Parameter.arg("input", String.class);
+        definition.method("returning", int.class, returningInput).access(PUBLIC, STATIC).body()
+                .ret(invokeStatic(Math.class, "addExact", int.class, constantInt(1), parseOr(returningInput, constantInt(-1).ret())));
+
+        // A return runs the finally block above the operands, where its handler throws.
+        Parameter finallyInput = Parameter.arg("input", String.class);
+        definition.method("finallyThrowing", int.class, finallyInput).access(PUBLIC, STATIC).body()
+                .append(TryCatch.builder()
+                        .tryBlock(invokeStatic(Math.class, "addExact", int.class, constantInt(1), new SetupThen(CodeBlock.block(constantInt(2).ret()), constantInt(3))).ret())
+                        .finallyBlock(TryCatch.builder()
+                                .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, finallyInput).pop())
+                                .catching(NumberFormatException.class, "e", (body, _) -> body.append(bad))
+                                .build())
+                        .build());
+
+        // A catch block starts on an empty operand stack, so it may catch exceptions and return
+        // through a finally block that catches them.
+        Parameter catchingInput = Parameter.arg("input", String.class);
+        CodeBlock.Builder catchingHandler = CodeBlock.blockBuilder();
+        catchingHandler.append(TryCatch.builder()
+                        .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, catchingInput).pop())
+                        .catching(NumberFormatException.class, "inner", (_, _) -> {})
+                        .build())
+                .append(constantInt(-1).ret());
+        definition.method("handlerCatching", int.class, catchingInput).access(PUBLIC, STATIC).body()
+                .ret(constantInt(1).add(new SetupThen(CodeBlock.block(TryCatch.builder()
+                        .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, catchingInput).pop())
+                        .catching(NumberFormatException.class, "e", (body, _) -> body.append(catchingHandler.build()))
+                        .build()), constantInt(2))));
+        Parameter handlerFinallyInput = Parameter.arg("input", String.class);
+        definition.method("handlerFinally", int.class, handlerFinallyInput).access(PUBLIC, STATIC).body()
+                .append(TryCatch.builder()
+                        .tryBlock(constantInt(1).add(new SetupThen(CodeBlock.block(TryCatch.builder()
+                                .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, handlerFinallyInput).pop())
+                                .catching(NumberFormatException.class, "e", (body, _) -> body.append(constantInt(-1).ret()))
+                                .build()), constantInt(2))).ret())
+                        .finallyBlock(catchingParse())
+                        .build());
+
+        // An earlier snapshot of a builder, placed in a setup inside a later snapshot of the same builder,
+        // binds its own copy of the builder's labels.
+        CodeBlock.Builder nestedSnapshot = definition.method("nestedSnapshot", int.class).access(PUBLIC, STATIC).body();
+        Variable snapshotResult = nestedSnapshot.declare(CD_int, "snapshotResult");
+        CodeBlock.Builder snapshotBuilder = CodeBlock.blockBuilder();
+        CodeLabel snapshotDone = snapshotBuilder.label("done");
+        snapshotBuilder.jump(snapshotDone).mark(snapshotDone);
+        snapshotBuilder.append(snapshotResult.set(constantInt(1).add(new SetupThen(snapshotBuilder.build(), constantInt(2)))));
+        nestedSnapshot.append(snapshotBuilder.build()).ret(snapshotResult);
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledClass compiledClass = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileClass(definition.build());
+        Class<?> generated = defineHidden(lookup, compiledClass).lookupClass();
+        assertThat(generated.getMethod("value", String.class, int.class).invoke(null, "12", 4)).isEqualTo(18);
+        assertThat(generated.getMethod("value", String.class, int.class).invoke(null, "x", 3)).isEqualTo(2);
+        assertThat(generated.getMethod("value", String.class, int.class).invoke(null, "12", -1)).isEqualTo(-100);
+        assertThat(generated.getMethod("value", String.class, int.class).invoke(null, null, 1)).isEqualTo(-200);
+        assertThat(generated.getMethod("throwing", String.class).invoke(null, "12")).isEqualTo(13);
+        assertThatThrownBy(() -> generated.getMethod("throwing", String.class).invoke(null, "x"))
+                .cause().isInstanceOf(IllegalArgumentException.class).hasMessage("bad");
+        assertThat(generated.getMethod("returning", String.class).invoke(null, "12")).isEqualTo(13);
+        assertThat(generated.getMethod("returning", String.class).invoke(null, "x")).isEqualTo(-1);
+        assertThat(generated.getMethod("finallyThrowing", String.class).invoke(null, "12")).isEqualTo(2);
+        assertThatThrownBy(() -> generated.getMethod("finallyThrowing", String.class).invoke(null, "x"))
+                .cause().isInstanceOf(IllegalArgumentException.class).hasMessage("bad");
+        assertThat(generated.getMethod("handlerCatching", String.class).invoke(null, "12")).isEqualTo(3);
+        assertThat(generated.getMethod("handlerCatching", String.class).invoke(null, "x")).isEqualTo(-1);
+        assertThat(generated.getMethod("handlerFinally", String.class).invoke(null, "12")).isEqualTo(3);
+        assertThat(generated.getMethod("handlerFinally", String.class).invoke(null, "x")).isEqualTo(-1);
+        assertThat(generated.getMethod("nestedSnapshot").invoke(null)).isEqualTo(3);
+    }
+
+    private static SetupThen parseOr(Parameter input, BytecodeExpression handler)
+    {
+        CodeBlock.Builder setup = CodeBlock.blockBuilder();
+        Variable parsed = setup.declare(CD_int, "parsed");
+        setup.append(TryCatch.builder()
+                .tryBlock(parsed.set(invokeStatic(Integer.class, "parseInt", int.class, input)))
+                .catching(NumberFormatException.class, "e", (body, _) -> body.append(handler))
+                .build());
+        return new SetupThen(setup.build(), parsed);
+    }
+
+    @Test
+    void testSetupWithOperandsOnStackCannotLeaveItsStackDepth()
+    {
+        // A handler discards the operands already pushed.
+        SetupThen catching = new SetupThen(CodeBlock.block(catchingParse()), constantInt(2));
+        String catchBlock = "have a catch block that may complete normally";
+        assertStackedSetupRejected(catchBlock, (body, _) -> body.ret(constantInt(1).add(catching)));
+        assertStackedSetupRejected(catchBlock, (body, _) -> body.ret(BytecodeExpressions.newInstance(StringBuilder.class, catching).invoke("length", int.class)));
+        // Compared as a value, a null constant is pushed before the other operand.
+        SetupThen catchingString = new SetupThen(CodeBlock.block(catchingParse()), constantString("x"));
+        assertStackedSetupRejected(catchBlock, (body, _) -> body.append(constantNull(String.class).equal(catchingString).pop())
+                .ret(constantInt(0)));
+        // A constructor invocation evaluates its arguments above the receiver.
+        ClassDesc type = generatedClass("StackedSetup");
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL).superClass(ArrayList.class);
+        definition.constructor().access(PUBLIC).body()
+                .invokeSuperConstructor(catching)
+                .ret();
+        assertThatThrownBy(definition::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Synthetic expression setup cannot " + catchBlock + " while operands are on the stack: setupThen in public " + type.displayName() + "()");
+
+        // A handler that cannot complete normally still may not jump out of its catch block.
+        assertStackedSetupRejected("jump out of a catch block", (body, condition) -> {
+            WhileLoop.Builder loop = WhileLoop.builder();
+            SetupThen breaking = new SetupThen(CodeBlock.block(TryCatch.builder()
+                    .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("x")).pop())
+                    .catching(NumberFormatException.class, "e", (handler, _) -> handler.append(loop.breakLoop()))
+                    .build()), constantInt(2));
+            body.append(loop.condition(condition).body(constantInt(1).add(breaking).pop()).build())
+                    .ret(constantInt(0));
+        });
+        assertStackedSetupRejected("jump out of a catch block to label end", (body, _) -> {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            CodeLabel end = setup.label("end");
+            setup.append(TryCatch.builder()
+                            .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("x")).pop())
+                            .catching(NumberFormatException.class, "e", (handler, _) -> handler.jump(end))
+                            .build())
+                    .mark(end);
+            body.ret(constantInt(1).add(new SetupThen(setup.build(), constantInt(2))));
+        });
+
+        // Code outside the setup runs below the operands.
+        assertStackedSetupRejected("jump outside itself", (body, condition) -> {
+            WhileLoop.Builder loop = WhileLoop.builder();
+            body.append(loop.condition(condition)
+                            .body(constantInt(1).add(new SetupThen(CodeBlock.block(loop.breakLoop()), constantInt(2))).pop())
+                            .build())
+                    .ret(constantInt(0));
+        });
+        assertStackedSetupRejected("jump outside itself to label end", (body, _) -> {
+            CodeLabel end = body.label("end");
+            CodeBlock.Builder jump = CodeBlock.blockBuilder();
+            jump.jump(end);
+            body.append(constantInt(1).add(new SetupThen(jump.build(), constantInt(2))).pop())
+                    .mark(end)
+                    .ret(constantInt(0));
+        });
+        // The exception handler's copy of a finally block runs below the operands.
+        assertStackedSetupRejected("jump out of a finally block to label end", (body, _) -> {
+            CodeBlock.Builder setup = CodeBlock.blockBuilder();
+            CodeLabel end = setup.label("end");
+            CodeBlock.Builder jump = CodeBlock.blockBuilder();
+            jump.jump(end);
+            setup.append(TryCatch.builder()
+                            .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("1")).pop())
+                            .finallyBlock(jump.build())
+                            .build())
+                    .mark(end);
+            body.ret(constantInt(1).add(new SetupThen(setup.build(), constantInt(2))));
+        });
+
+        // A return runs a copy of each enclosing finally block above the operands.
+        String finallyCatchBlock = "return through a finally block with a catch block that may complete normally";
+        assertStackedSetupRejected(finallyCatchBlock, (body, _) -> body.append(TryCatch.builder()
+                        .tryBlock(constantInt(1).add(new SetupThen(CodeBlock.block(constantInt(2).ret()), constantInt(3))).ret())
+                        .finallyBlock(catchingParse())
+                        .build())
+                .ret(constantInt(0)));
+        // A setup stacked again in a catch block runs its return's finally copies above its own operands.
+        assertStackedSetupRejected(finallyCatchBlock, (body, _) -> body.append(TryCatch.builder()
+                        .tryBlock(constantInt(1).add(new SetupThen(CodeBlock.block(TryCatch.builder()
+                                .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("x")).pop())
+                                .catching(NumberFormatException.class, "e", (handler, _) -> handler.append(constantInt(4)
+                                        .add(new SetupThen(CodeBlock.block(constantInt(2).ret()), constantInt(3)))
+                                        .ret()))
+                                .build()), constantInt(2))).ret())
+                        .finallyBlock(catchingParse())
+                        .build())
+                .ret(constantInt(0)));
+        assertStackedSetupRejected("return through a finally block that jumps out of itself", (body, condition) -> {
+            WhileLoop.Builder loop = WhileLoop.builder();
+            body.append(loop.condition(condition)
+                            .body(TryCatch.builder()
+                                    .tryBlock(constantInt(1).add(new SetupThen(CodeBlock.block(constantInt(2).ret()), constantInt(3))).ret())
+                                    .finallyBlock(CodeBlock.block(loop.breakLoop()))
+                                    .build())
+                            .build())
+                    .ret(constantInt(0));
+        });
+        // The exception handler of a catch block in the finally copy runs below the operands.
+        assertStackedSetupRejected("return through a finally block that jumps out of a catch block in it to label end", (body, _) -> {
+            CodeBlock.Builder finallyBlock = CodeBlock.blockBuilder();
+            CodeLabel end = finallyBlock.label("end");
+            finallyBlock.append(TryCatch.builder()
+                            .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("x")).pop())
+                            .catching(NumberFormatException.class, "e", (handler, _) -> handler.jump(end))
+                            .build())
+                    .mark(end);
+            body.append(TryCatch.builder()
+                            .tryBlock(constantInt(1).add(new SetupThen(CodeBlock.block(constantInt(2).ret()), constantInt(3))).ret())
+                            .finallyBlock(finallyBlock.build())
+                            .build())
+                    .ret(constantInt(0));
+        });
+    }
+
+    private static void assertStackedSetupRejected(String reason, BiConsumer<CodeBlock.Builder, Parameter> body)
+    {
+        ClassDefinition definition = ClassDefinition.define(generatedClass("StackedSetup")).access(PUBLIC, FINAL);
+        Parameter condition = Parameter.arg("condition", boolean.class);
+        MethodDefinition method = definition.method("value", int.class, condition).access(PUBLIC, STATIC);
+        body.accept(method.body(), condition);
+        assertThatThrownBy(definition::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Synthetic expression setup cannot " + reason + " while operands are on the stack: setupThen in public static int value(boolean condition)");
+    }
+
+    private static TryCatch catchingParse()
+    {
+        return TryCatch.builder()
+                .tryBlock(invokeStatic(Integer.class, "parseInt", int.class, constantString("1")).pop())
+                .catching(NumberFormatException.class, "e", (_, _) -> {})
+                .build();
+    }
+
     private static ClassDesc generatedClass(String suffix)
     {
         return ClassDesc.of(TestSyntheticExpressions.class.getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
@@ -320,6 +584,28 @@ class TestSyntheticExpressions
         public String toString()
         {
             return "addThenDouble(" + input + ")";
+        }
+    }
+
+    private record SetupThen(CodeBlock setup, BytecodeExpression value)
+            implements SyntheticExpression
+    {
+        @Override
+        public ClassDesc type()
+        {
+            return value.type();
+        }
+
+        @Override
+        public ExpressionPlan expansion(ExpansionContext context)
+        {
+            return new ExpressionPlan(setup, value);
+        }
+
+        @Override
+        public String toString()
+        {
+            return "setupThen";
         }
     }
 
