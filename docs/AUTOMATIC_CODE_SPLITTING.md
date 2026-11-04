@@ -141,8 +141,9 @@ After emission, the compiler compares every exact method size with this limit. A
 method above it causes `CompilationException`; it is never returned as a warning.
 This check applies to `compileClass(...)`, `compileClassBundle(...)`, and
 `compileUnit(...)`.
-The JDK Class-File API and verifier remain the backstop for other bounded classfile
-structures, including descriptors and constant pools.
+The JDK Class-File API and the JVM's checks when it defines and links a class remain
+the backstop for other bounded classfile structures, including descriptors and
+constant pools.
 
 Lower hard limits are useful in tests because they exercise splitting without
 creating enormous fixtures.
@@ -181,8 +182,8 @@ target to inline through the adapter can inflate the consumer's C2 graph.
 The compiler therefore emits and parses the class once to measure exact implementation
 method sizes. A non-constructor target in the upper half of the range between
 `MaxInlineSize` and `FreqInlineSize` receives harmless load/pop padding that moves it
-one byte beyond `FreqInlineSize`; the class is then emitted, parsed, measured, and
-verified again. Smaller targets and targets already above `FreqInlineSize` are not
+one byte beyond `FreqInlineSize`; the class is then emitted, parsed, and measured
+again. Smaller targets and targets already above `FreqInlineSize` are not
 re-emitted. This is a JIT-boundary adjustment, not statement splitting, and the final
 measured classfile is the one recorded in `CompilationReport`.
 
@@ -665,8 +666,10 @@ The compiler measures the final classfiles and enforces the hard method limit th
 It does not currently feed exact measurements into an iterative replanning pass.
 
 A method above the configured hard limit fails with its physical class, method,
-descriptor, actual size, and configured limit. Verification failures include a JDK
-classfile disassembly to aid diagnosis.
+descriptor, actual size, and configured limit. When the JVM rejects a class a definer is
+defining and the JDK verifier finds a defect in it or in a class defined with it, the
+definer fails with a verification error that includes a JDK classfile disassembly of the
+defective class to aid diagnosis; otherwise the rejection is the JVM's own error.
 
 ## Inspection And Tests
 

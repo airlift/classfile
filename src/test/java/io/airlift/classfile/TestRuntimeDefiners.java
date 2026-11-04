@@ -13,10 +13,12 @@
  */
 package io.airlift.classfile;
 
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.classfile.ClassFile;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDesc;
 import java.lang.constant.DirectMethodHandleDesc;
@@ -67,6 +69,7 @@ import static java.lang.constant.ConstantDescs.CD_void;
 import static java.lang.invoke.MethodHandles.Lookup.ClassOption.NESTMATE;
 import static java.lang.reflect.AccessFlag.ABSTRACT;
 import static java.lang.reflect.AccessFlag.FINAL;
+import static java.lang.reflect.AccessFlag.INTERFACE;
 import static java.lang.reflect.AccessFlag.PRIVATE;
 import static java.lang.reflect.AccessFlag.PUBLIC;
 import static java.lang.reflect.AccessFlag.STATIC;
@@ -1116,6 +1119,10 @@ class TestRuntimeDefiners
         assertThatThrownBy(() -> definer.defineClasses(List.of(failing, untouched)))
                 .isInstanceOf(ExceptionInInitializerError.class);
 
+        // A definer that does not initialize links the class without running its static initializer.
+        StandardClassDefiner uninitialized = StandardClassDefiner.builder(getClass().getClassLoader()).initialize(false).build();
+        assertThat(uninitialized.defineClasses(List.of(failing, untouched)).definedClass(failing)).isNotNull();
+
         ClassDefinition replacementDefinition = ClassDefinition.define(untouched.type()).access(PUBLIC, FINAL);
         replacementDefinition.method("value", int.class).access(PUBLIC, STATIC).body().ret(constantInt(9));
         Class<?> replacement = definer.defineClass(replacementDefinition.build());
@@ -1137,6 +1144,84 @@ class TestRuntimeDefiners
         assertThatThrownBy(() -> definer.defineClass(duplicateDependency.build()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("already defined or pending");
+    }
+
+    @Test
+    void testDefinersExplainClassesTheJvmRejects()
+    {
+        StandardClassDefiner standard = StandardClassDefiner.builder(getClass().getClassLoader()).build();
+        StandardClassDefiner uninitialized = StandardClassDefiner.builder(getClass().getClassLoader()).initialize(false).build();
+        HiddenClassDefiner hidden = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        List<Function<ClassModel, ?>> definitions = List.of(
+                standard::defineClass,
+                model -> standard.defineUnit(ClassCompiler.forTarget(standard.compilationTarget()).compileUnit(model)),
+                uninitialized::defineClass,
+                model -> uninitialized.defineUnit(ClassCompiler.forTarget(uninitialized.compilationTarget()).compileUnit(model)),
+                hidden::defineClass,
+                model -> hidden.defineUnit(ClassCompiler.forTarget(hidden.compilationTarget()).compileUnit(model)));
+        for (Function<ClassModel, ?> definition : definitions) {
+            ClassDefinition unverifiable = ClassDefinition.define(generatedClass("Unverifiable")).access(PUBLIC, FINAL);
+            unverifiableEvaluate(unverifiable);
+            ClassModel model = unverifiable.build();
+            assertVerificationFailure(() -> definition.apply(model), model.type());
+        }
+
+        // An uninitialized definer links a generated method's owner when it finds the method, before the rest of the unit is defined.
+        ClassDefinition helperDefinition = ClassDefinition.define(generatedClass("UnverifiableLinkedHelper")).access(PUBLIC, FINAL);
+        MethodDefinition helperEvaluate = unverifiableEvaluate(helperDefinition);
+        ClassModel helper = helperDefinition.build();
+        ClassDefinition primary = ClassDefinition.define(generatedClass("UnverifiableLinkedPrimary")).access(PUBLIC, FINAL);
+        primary.method("evaluate", CD_int).access(PUBLIC, STATIC).body().ret(BytecodeExpressions.invokeLinked(helperEvaluate));
+        CompiledUnit unit = ClassCompiler.forTarget(uninitialized.compilationTarget()).compileUnit(primary.build(), List.of(helper));
+        assertVerificationFailure(() -> uninitialized.defineUnit(unit), helper.type());
+
+        // HotSpot reports a defective superclass while linking its subclass.
+        ClassDefinition superclassDefinition = ClassDefinition.define(generatedClass("UnverifiableSuperclass")).access(PUBLIC);
+        unverifiableEvaluate(superclassDefinition);
+        ClassModel superclass = superclassDefinition.build();
+        ClassModel subclass = ClassDefinition.define(generatedClass("VerifiableSubclass")).access(PUBLIC, FINAL).superClass(superclass.type()).build();
+        assertVerificationFailure(() -> standard.defineClasses(List.of(subclass, superclass)), superclass.type());
+    }
+
+    private static MethodDefinition unverifiableEvaluate(ClassDefinition definition)
+    {
+        MethodDefinition evaluate = definition.method("evaluate", CD_int).access(PUBLIC, STATIC);
+        // Model validation does not check definite assignment, so only the verifier rejects this uninitialized read.
+        evaluate.body().ret(evaluate.body().declare(int.class, "x"));
+        return evaluate;
+    }
+
+    private static void assertVerificationFailure(ThrowingCallable definition, ClassDesc type)
+    {
+        assertThatThrownBy(definition)
+                .isInstanceOf(CompilationException.class)
+                .hasMessageStartingWith("Verification failed for " + type.displayName() + ":\n")
+                .hasMessageContaining("method [PUBLIC, STATIC] evaluate()int")
+                .hasMessageContaining("verification errors:")
+                .cause()
+                .isInstanceOf(VerifyError.class);
+    }
+
+    @Test
+    @SuppressWarnings("BanClassLoader") // The test defines a supertype the library cannot generate.
+    void testUninitializedDefinerIgnoresInheritedFieldTypes()
+            throws IllegalAccessException
+    {
+        // An interface constant typed by an absent optional dependency must not stop a generated class from linking.
+        byte[] interfaceClassfile = ClassFile.of().build(generatedClass("InterfaceWithUnloadableConstant"), builder -> builder
+                .withFlags(PUBLIC, INTERFACE, ABSTRACT)
+                .withField("CONSTANT", ClassDesc.of("missing.Missing"), field -> field.withFlags(PUBLIC, STATIC, FINAL)));
+        Class<?> interfaceType = MethodHandles.lookup().defineClass(interfaceClassfile);
+
+        StandardClassDefiner uninitialized = StandardClassDefiner.builder(getClass().getClassLoader()).initialize(false).build();
+        List<Function<ClassModel, ?>> definitions = List.of(
+                uninitialized::defineClass,
+                model -> uninitialized.defineUnit(ClassCompiler.forTarget(uninitialized.compilationTarget()).compileUnit(model)));
+        for (Function<ClassModel, ?> definition : definitions) {
+            ClassDefinition implementation = ClassDefinition.define(generatedClass("InheritsUnloadableConstant")).access(PUBLIC, FINAL).addInterface(interfaceType);
+            implementation.method("value", CD_int).access(PUBLIC, STATIC).body().ret(constantInt(7));
+            assertThat(definition.apply(implementation.build())).isNotNull();
+        }
     }
 
     @Test
