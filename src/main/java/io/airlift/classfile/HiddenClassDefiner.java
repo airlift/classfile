@@ -95,6 +95,10 @@ public final class HiddenClassDefiner
         catch (IllegalAccessException e) {
             throw new IllegalStateException("Unable to define hidden class", e);
         }
+        catch (LinkageError e) {
+            throw ClassVerification.explainRejection(compiledClass.target(), () -> Map.of(compiledClass.type(), compiledClass.classfile()), e)
+                    .orElseThrow(() -> e);
+        }
     }
 
     /// Defines every physical class in dependency order and returns the primary class and hidden
@@ -136,6 +140,13 @@ public final class HiddenClassDefiner
             }
             catch (IllegalAccessException e) {
                 throw new IllegalStateException("Unable to define hidden class " + type.displayName(), e);
+            }
+            catch (LinkageError e) {
+                throw ClassVerification.explainRejection(unit.target(), () -> {
+                    LinkedHashMap<ClassDesc, byte[]> classfiles = new LinkedHashMap<>();
+                    unit.types().forEach(unitType -> classfiles.put(unitType, unit.classfile(unitType)));
+                    return classfiles;
+                }, e).orElseThrow(() -> e);
             }
 
             classes.put(type, defined.lookupClass());

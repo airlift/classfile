@@ -72,8 +72,8 @@ The architectural guarantees are:
   assigned during compilation or emission, never authoring;
 - structured control flow is preferred, with symbolic labels retained as an advanced
   escape hatch;
-- complete models are validated before emission and emitted classfiles are verified
-  with the JDK Class-File API;
+- complete models are validated before emission, and a classfile the JVM rejects
+  during definition is verified with the JDK Class-File API to explain the failure;
 - nominal and hidden definitions use the same logical and physical planning model;
 - automatic splitting favors runnable valid code and reports missed optimization
   targets without turning them into correctness failures.

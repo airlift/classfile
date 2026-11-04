@@ -19,6 +19,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.DescriptorUtils.classDesc;
@@ -97,10 +98,17 @@ final class LambdaFactory
         CompiledClass compiled = ClassCompiler.forTarget(CompilationTarget.forLookup(hostLookup))
                 .compileClass(adapter.build());
         compiled.validateRuntimeData(compiled.runtimeData());
-        MethodHandles.Lookup defined = hostLookup.defineHiddenClassWithClassData(
-                compiled.classfile(),
-                compiled.runtimeData(),
-                true);
+        MethodHandles.Lookup defined;
+        try {
+            defined = hostLookup.defineHiddenClassWithClassData(
+                    compiled.classfile(),
+                    compiled.runtimeData(),
+                    true);
+        }
+        catch (LinkageError e) {
+            throw ClassVerification.explainRejection(compiled.target(), () -> Map.of(compiled.type(), compiled.classfile()), e)
+                    .orElseThrow(() -> e);
+        }
         MethodHandle factory = defined.findConstructor(
                 defined.lookupClass(),
                 MethodType.methodType(void.class, factoryType.parameterArray()));

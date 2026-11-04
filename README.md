@@ -81,9 +81,10 @@ helpers.
 
 ### Built on the JDK
 
-Classfile emits and verifies classes with the `java.lang.classfile` API built into
-Java 25. Class generation stays aligned with the classfile support of the running
-JDK, and production code has no third-party dependencies.
+Classfile emits classes with the `java.lang.classfile` API built into Java 25, and uses
+the JDK verifier to explain classes the JVM rejects while a definer defines them. Class
+generation stays aligned with the classfile support of the running JDK, and production
+code has no third-party dependencies.
 
 ## Documentation
 

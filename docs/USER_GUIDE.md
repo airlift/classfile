@@ -903,6 +903,15 @@ String disassembly = ClassFileDiagnostics.disassemble(bytes);
 ClassFileDiagnostics.dump(outputDirectory, bytes);
 ```
 
+Compilation does not verify classes. When the JVM rejects a class a definer is defining,
+the definer runs the JDK verifier over the classes it was defining. If the verifier
+finds an error in one of them, the definer throws `CompilationException` with that
+class's disassembly, keeping the JVM's error as the cause; otherwise the JVM's error
+propagates. Code that takes the bytes and defines them some other way can call
+`ClassFileDiagnostics.verify` or `disassemble` itself. `ClassFileDiagnostics` resolves
+class hierarchy without the unit's generated types, so it can report "Could not resolve
+class" for a class whose verification needs them.
+
 Logical descriptions improve model dumps. Source-derived helper names make physical
 reports, disassembly, and production stack traces easier to interpret.
 

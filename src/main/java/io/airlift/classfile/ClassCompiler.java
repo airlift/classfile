@@ -13,8 +13,6 @@
  */
 package io.airlift.classfile;
 
-import io.airlift.classfile.tool.ClassFileDiagnostics;
-
 import java.lang.classfile.Attribute;
 import java.lang.classfile.ClassBuilder;
 import java.lang.classfile.ClassFile;
@@ -319,10 +317,6 @@ public final class ClassCompiler
                 classfile = buildClassfile(definition, bindings, classFile, linkage, lambdaBoundaryPadding);
                 parsedClassfile = classFile.parse(classfile);
                 classInfo = CompilationReport.measure(definition.type(), classfile, parsedClassfile);
-            }
-            List<VerifyError> errors = classFile.verify(parsedClassfile);
-            if (!errors.isEmpty()) {
-                throw new CompilationException("Verification failed for " + definition.type().displayName() + ":\n" + ClassFileDiagnostics.disassemble(classfile));
             }
             return new EmittedClass(
                     classfile,

@@ -453,8 +453,8 @@ The descriptor-explicit forms support generated and unloaded constructors. The
 reflective superclass form additionally validates that the selected constructor's
 owner is the generated class's direct superclass. Calls in loop bodies or protected
 try/catch/finally regions are rejected because their exactly-once path semantics are
-not represented safely by the structured validator. Raw-label paths remain a
-JDK-verifier backstop rather than expanding this API into a bytecode data-flow DSL.
+not represented safely by the structured validator. Raw-label paths rely on JVM
+verification instead of expanding this API into a bytecode data-flow DSL.
 
 `ClassDefinition.defaultConstructor()` covers the common no-argument
 constructor that invokes the configured superclass constructor and returns. It
@@ -625,9 +625,44 @@ identity-based visited set for context-sensitive placement validation.
 
 ### Classfile validation
 
-After emission, `ClassFile.verify` validates JVM structure, stack maps, exception
-edges, and linkage constraints. Errors include the declarative model path, generated
-class and method, and a readable JDK class-model disassembly when available.
+Compilation does not run `ClassFile.verify` over emitted classes. A working compiler's
+classes always pass, and the JVM checks every class again when it defines and links it,
+rejecting a structural error with a `ClassFormatError` at definition and a bytecode
+error with a `VerifyError` at linking. The definers verify only when the JVM rejects a
+class they are defining: they run `ClassFile.verify` over every class defined with it,
+resolving the generated types' hierarchy as compilation did, because HotSpot may report
+a defective superclass while defining or linking a subclass. The first class with
+verifier errors fails with a `CompilationException` that names the generated class and
+includes a readable JDK class-model disassembly with the method code and the verifier
+errors, recomputed as `ClassFileDiagnostics` does; the JVM's error is its cause. A
+rejection the verifier does not explain, such as an access, duplicate-definition, or
+initialization error, propagates as the JVM reported it, or wrapped in
+`IllegalStateException` when it surfaces while linking a unit's generated method, unless
+another class defined with it fails the verifier; that class is then reported, with the
+JVM's error as the cause.
+
+The JVM rejects a defective class inside the library, and so produces this failure,
+when:
+
+- a hidden definer defines it, since hidden classes are linked at definition;
+- the standard definer defines it, since it links every class it defines: with
+  initialization as it initializes each one, and without initialization once the whole
+  set is defined. Without initialization this relies on HotSpot linking a class when its
+  declared fields are reflected, which the Java SE specification does not guarantee;
+- a hidden lambda adapter is defined at the lambda's first bootstrap, where the JVM
+  wraps the failure in a `BootstrapMethodError`.
+
+The JVM's checks do not cover every metadata error `ClassFile.verify` detects; an
+oversized invisible-annotations attribute, for example, is accepted. HotSpot also
+verifies bytecode only for classes outside the boot loader unless configured otherwise,
+so a hidden class whose lookup host is in the boot loader gets no bytecode verification.
+The definers define such classes without error.
+
+Callers that take compiled classfile bytes and define them some other way get no
+verification from the library; they can run `ClassFileDiagnostics.verify` or
+`disassemble` themselves. `ClassFileDiagnostics` resolves class hierarchy without the
+unit's generated types, so it can report "Could not resolve class" for a class whose
+verification needs them.
 
 ## Rendering And Diagnostics
 

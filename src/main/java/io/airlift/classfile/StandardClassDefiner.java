@@ -17,11 +17,13 @@ import java.lang.constant.ClassDesc;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
@@ -97,6 +99,7 @@ public final class StandardClassDefiner
         RuntimeData effectiveRuntimeData = RuntimeData.merge(classLoader.configuredRuntimeData(), compiledClass.runtimeData());
         compiledClass.validateRuntimeData(effectiveRuntimeData);
         return defineClassfiles(
+                compiledClass.target(),
                 Map.of(compiledClass.type(), compiledClass.classfile()),
                 Map.of(compiledClass.type(), effectiveRuntimeData))
                 .definedClass(compiledClass.type());
@@ -111,7 +114,7 @@ public final class StandardClassDefiner
         compiledClasses.validateRuntimeData(effectiveRuntimeData);
         LinkedHashMap<ClassDesc, RuntimeData> runtimeData = new LinkedHashMap<>();
         compiledClasses.types().forEach(type -> runtimeData.put(type, effectiveRuntimeData));
-        return defineClassfiles(compiledClasses.classfiles(), runtimeData);
+        return defineClassfiles(compiledClasses.target(), compiledClasses.classfiles(), runtimeData);
     }
 
     /// Defines every physical class in dependency order and returns the primary class. The unit
@@ -148,6 +151,10 @@ public final class StandardClassDefiner
                 catch (ClassNotFoundException e) {
                     throw new IllegalStateException("Unable to define generated class " + type.displayName(), e);
                 }
+                catch (LinkageError e) {
+                    throw ClassVerification.explainRejection(unit.target(), () -> classfiles, e)
+                            .orElseThrow(() -> e);
+                }
                 classes.put(type, definedClass);
                 for (CompiledUnit.LinkedMethod method : unit.linkedMethodsOwnedBy(type)) {
                     try {
@@ -155,9 +162,19 @@ public final class StandardClassDefiner
                         linkedMethods.put(method, MethodHandles.publicLookup().findStatic(definedClass, method.name(), methodType));
                     }
                     catch (NoSuchMethodException | IllegalAccessException e) {
+                        // Finding the method links the class, so the JVM may reject it here.
+                        if (e.getCause() instanceof LinkageError rejection) {
+                            Optional<CompilationException> failure = ClassVerification.explainRejection(unit.target(), () -> classfiles, rejection);
+                            if (failure.isPresent()) {
+                                throw failure.orElseThrow();
+                            }
+                        }
                         throw new IllegalStateException("Unable to link generated method " + method, e);
                     }
                 }
+            }
+            if (!initialize) {
+                link(unit.target(), classfiles, classes.values());
             }
             completed = true;
             return new DefinedUnit(unit.primaryType(), classes, Map.of());
@@ -169,8 +186,9 @@ public final class StandardClassDefiner
         }
     }
 
-    private DefinedClasses defineClassfiles(Map<ClassDesc, byte[]> classfiles, Map<ClassDesc, RuntimeData> runtimeData)
+    private DefinedClasses defineClassfiles(CompilationTarget target, Map<ClassDesc, byte[]> classfiles, Map<ClassDesc, RuntimeData> runtimeData)
     {
+        requireNonNull(target, "target is null");
         requireNonNull(classfiles, "classfiles is null");
         GeneratedClassLoader.Reservation reservation = classLoader.reserve(classfiles, requireNonNull(runtimeData, "runtimeData is null"));
 
@@ -184,6 +202,13 @@ public final class StandardClassDefiner
                 catch (ClassNotFoundException e) {
                     throw new IllegalStateException("Unable to define generated class " + type.displayName(), e);
                 }
+                catch (LinkageError e) {
+                    throw ClassVerification.explainRejection(target, () -> classfiles, e)
+                            .orElseThrow(() -> e);
+                }
+            }
+            if (!initialize) {
+                link(target, classfiles, classes.values());
             }
             completed = true;
             return new DefinedClasses(classes);
@@ -191,6 +216,27 @@ public final class StandardClassDefiner
         finally {
             if (!completed) {
                 classLoader.releasePending(reservation);
+            }
+        }
+    }
+
+    /// Links each defined class without initializing it, so the JVM rejects a defective class at
+    /// definition. The Java SE specification lets the JVM link a class lazily, and
+    /// `ClassLoader.resolveClass` does not link a class in OpenJDK. HotSpot links a class before
+    /// reflecting on its fields, so asking for its declared fields links it here. This is HotSpot
+    /// behavior, not a specification guarantee. Only declared fields are asked for: reflecting
+    /// inherited fields would also resolve the field types of every supertype, which the class
+    /// may never use.
+    @SuppressWarnings("ReturnValueIgnored")
+    private static void link(CompilationTarget target, Map<ClassDesc, byte[]> classfiles, Collection<Class<?>> classes)
+    {
+        for (Class<?> definedClass : classes) {
+            try {
+                definedClass.getDeclaredFields();
+            }
+            catch (LinkageError e) {
+                throw ClassVerification.explainRejection(target, () -> classfiles, e)
+                        .orElseThrow(() -> e);
             }
         }
     }
@@ -236,6 +282,9 @@ public final class StandardClassDefiner
             return this;
         }
 
+        /// Sets whether each defined class's static initializer runs at definition; the default is
+        /// `true`. Without initialization the definer still links every class it defines, so the
+        /// JVM rejects a defective class at definition.
         public Builder initialize(boolean initialize)
         {
             if (initializeSet) {
