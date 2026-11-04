@@ -543,7 +543,7 @@ public final class ClassCompiler
         }
     }
 
-    private static boolean[] aliasCopyDeclarations(List<Statement> statements)
+    static boolean[] aliasCopyDeclarations(List<Statement> statements)
     {
         boolean hasCandidate = false;
         for (Statement statement : statements) {
@@ -835,6 +835,7 @@ public final class ClassCompiler
         }
     }
 
+    // Keep this evaluation order in sync with MethodFlow.evaluateStep and ScopeValidator.pushChildren in ModelValidator.
     private static void emitNode(ExpressionNode node, EmitContext context)
     {
         switch (node) {
@@ -925,7 +926,7 @@ public final class ClassCompiler
         context.store(target);
     }
 
-    private static boolean canEmitSyntheticValue(ExpressionPlan plan)
+    static boolean canEmitSyntheticValue(ExpressionPlan plan)
     {
         if (!(plan.value() instanceof Variable result) ||
                 !result.owner().equals(plan.setup().scope()) ||
@@ -1398,6 +1399,7 @@ public final class ClassCompiler
         });
     }
 
+    // Keep this branch folding in sync with MethodFlow.branchStep and ScopeValidator.pushChildren in ModelValidator.
     private static void emitBranch(BytecodeExpression condition, boolean branchOnTrue, Label target, EmitContext context)
     {
         if (condition instanceof CoreExpression core) {

@@ -56,7 +56,7 @@ A finalized block can capture declarations from a compatible parent and own loca
 declarations of its own:
 
 ```java
-Variable result = method.body().declare(int.class, "result");
+Variable result = method.body().declare("result", constantInt(0));
 
 CodeBlock.Builder fragmentBuilder = CodeBlock.blockBuilder();
 Variable temporary = fragmentBuilder.declare(int.class, "temporary");
