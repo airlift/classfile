@@ -164,7 +164,7 @@ class TestBuilderPolicy
                 .hasMessageContaining("already attached");
 
         ClassDefinition retry = ClassDefinition.define(ClassDesc.of("test.RetryParameterOwner"));
-        retry.method("retry", void.class, fresh);
+        retry.method("retry", void.class, fresh).body().ret();
         assertThat(retry.build().methods().getFirst().parameters()).containsExactly(fresh);
     }
 
@@ -188,6 +188,7 @@ class TestBuilderPolicy
                 .access(PUBLIC)
                 .signature(methodSignature)
                 .comment("run");
+        method.body().ret();
 
         assertAlreadySet(() -> method.access(FINAL), "access is already set");
         assertAlreadySet(() -> method.signature(methodSignature), "signature is already set");
@@ -198,6 +199,7 @@ class TestBuilderPolicy
         assertThat(block.build().description()).isEqualTo("first");
 
         MethodDefinition packagePrivateMethod = classDefinition.method("packagePrivate", CD_void);
+        packagePrivateMethod.body().ret();
         assertThat(packagePrivateMethod.thisVariable().type()).isEqualTo(classDefinition.build().type());
     }
 
@@ -284,14 +286,15 @@ class TestBuilderPolicy
     {
         ClassDefinition classDefinition = ClassDefinition.define(ClassDesc.of("test.Snapshot"));
         MethodDefinition method = classDefinition.method("run", void.class).access(STATIC);
+        method.body().ret();
 
         ClassModel first = classDefinition.build();
         method.body().append(constantInt(1).pop());
-        classDefinition.method("other", void.class).access(STATIC);
+        classDefinition.method("other", void.class).access(STATIC).body().ret();
         ClassModel second = classDefinition.build();
 
         assertThat(first.methods()).hasSize(1);
-        assertThat(first.methods().getFirst().body().isEmpty()).isTrue();
+        assertThat(first.methods().getFirst().body().statements()).hasSize(1);
         assertThat(second.methods()).hasSize(2);
         assertThat(second.methods().getFirst().body().toString()).contains("1;");
     }

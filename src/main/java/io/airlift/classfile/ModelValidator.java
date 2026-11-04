@@ -746,6 +746,7 @@ final class ModelValidator
             validateReturns(method.body(), method.returnType(), identitySet());
         }
         validateConstructor(definition, method);
+        MethodFlow.validate(method, scopes.trackedDeclarationBound(), scopes.skippableDeclarations(), scopes.skippableSetupDeclarations());
     }
 
     private static void validateConstructor(ClassModel definition, MethodDefinition.Model method)
@@ -1008,7 +1009,7 @@ final class ModelValidator
                 (isNarrowInteger(target) && isNarrowInteger(source));
     }
 
-    private static boolean isLogical(ExpressionNode.Binary binary)
+    static boolean isLogical(ExpressionNode.Binary binary)
     {
         return binary.operator().equals("&&") || binary.operator().equals("||");
     }
@@ -1016,8 +1017,9 @@ final class ModelValidator
     // Conservatively, whether the end of a block can be reached: false only when its last statement
     // throws, returns, or jumps, or is a block or if statement whose blocks all end so. A label is
     // bound in its own block, so every label of such a block and of the blocks enclosing it precedes
-    // the last statement. A handler block in a stacked setup cannot jump to code outside itself.
-    private static boolean canCompleteNormally(CodeBlock block)
+    // the last statement. A handler block in a stacked setup cannot jump to code outside itself, and
+    // a method body has no code outside itself.
+    static boolean canCompleteNormally(CodeBlock block)
     {
         List<Statement> statements = block.statements();
         if (statements.isEmpty()) {
@@ -1038,7 +1040,7 @@ final class ModelValidator
         return isReturn(node) || (node instanceof ExpressionNode.Adapter adapter && adapter.keyword().equals("throw"));
     }
 
-    private static boolean isReturn(ExpressionNode node)
+    static boolean isReturn(ExpressionNode node)
     {
         return switch (node) {
             case ExpressionNode.Adapter adapter -> adapter.keyword().equals("return");
@@ -1049,8 +1051,9 @@ final class ModelValidator
 
     // Checks local, label, and loop scoping of method bodies in one walk, sharing one set of each
     // kind across nested scopes and undoing a scope's additions when it ends. The walk also detects
-    // block cycles, notes a return that disagrees with the method type, and rejects synthetic setup
-    // code that the emitter cannot place above operands already on the operand stack.
+    // block cycles, notes a return that disagrees with the method type, rejects synthetic setup
+    // code that the emitter cannot place above operands already on the operand stack, and notes
+    // the declarations the flow analysis must track.
     private static final class ScopeValidator
     {
         // Labels and loops keep their positions in the order of additions for the jump checks; locals
@@ -1068,13 +1071,31 @@ final class ModelValidator
         private boolean[] pendingStacked = new boolean[32];
         private boolean[] pendingConditions = new boolean[32];
         private int pendingCount;
-        // Labels bound so far in the current block, allocated at the first binding.
-        private Set<CodeLabel> boundLabels = Set.of();
+        // Labels bound so far in the innermost active placement of each block, allocated at the
+        // first binding.
+        private Set<CodeLabel> boundLabels;
+        // Labels that an enclosing placement of a block has bound, set aside while a nested placement
+        // of the same block, such as a snapshot appended to a later snapshot, binds them again.
+        private CodeLabel[] enclosingBoundLabels = new CodeLabel[0];
+        private int enclosingBoundLabelCount;
+        // Jumps to labels not yet bound, by the target's position in the visible labels. Such a
+        // jump skips the declarations before the binding, which the flow analysis must then track.
+        private int[] pendingJumps = new int[0];
+        private int pendingJumpCount;
         private MethodDefinition.Model method;
         private ClassDesc returnType;
         // Match validateReturns by skipping return checks in constructor arguments.
         private int constructorArgumentDepth;
         private boolean returnMismatch;
+        // Declarations the flow analysis tracks: those without an initializer, and those outside
+        // synthetic setups with one that a pending jump can skip. Setups are expanded again for the
+        // analysis, so once a pending jump can skip a declaration with an initializer in a setup,
+        // every declaration with an initializer counts toward the bound.
+        private int trackedDeclarations;
+        private Set<Variable> skippableDeclarations = Set.of();
+        private boolean skippableSetupDeclarations;
+        private int setupDepth;
+        private int initializedDeclarations;
         // Synthetic setups entered with operands on the stack. Their code runs above those operands,
         // so it must not rejoin code that runs at another stack depth. The innermost such synthetic
         // and the label and loop marks taken when its setup was entered describe the current level;
@@ -1107,6 +1128,10 @@ final class ModelValidator
             this.method = method;
             returnType = method.returnType();
             returnMismatch = false;
+            trackedDeclarations = 0;
+            skippableDeclarations = Set.of();
+            skippableSetupDeclarations = false;
+            initializedDeclarations = 0;
             List<Parameter> parameters = method.parameters();
             for (int index = 0; index < parameters.size(); index++) {
                 visible.add(parameters.get(index));
@@ -1119,6 +1144,26 @@ final class ModelValidator
             return !returnMismatch;
         }
 
+        // An upper bound on the variables the flow analysis of the last validated method tracks.
+        private int trackedDeclarationBound()
+        {
+            return trackedDeclarations + (skippableSetupDeclarations ? initializedDeclarations : 0);
+        }
+
+        // The declarations outside synthetic setups with an initializer that a jump can skip in
+        // the last validated method.
+        private Set<Variable> skippableDeclarations()
+        {
+            return skippableDeclarations;
+        }
+
+        // Whether a jump can skip a declaration with an initializer in a synthetic setup of the
+        // last validated method.
+        private boolean skippableSetupDeclarations()
+        {
+            return skippableSetupDeclarations;
+        }
+
         private void validateBlock(CodeBlock block, boolean accumulate)
         {
             if (!activeBlocks.add(block)) {
@@ -1126,22 +1171,33 @@ final class ModelValidator
             }
             int visibleMark = visible.mark();
             int labelMark = visibleLabels.mark();
+            int enclosingBoundLabelMark = enclosingBoundLabelCount;
             List<CodeLabel> labels = block.labels();
             for (int index = 0; index < labels.size(); index++) {
-                visibleLabels.add(labels.get(index));
+                CodeLabel label = labels.get(index);
+                visibleLabels.add(label);
+                // Each placement of the block binds its labels anew.
+                if (boundLabels != null && boundLabels.remove(label)) {
+                    if (enclosingBoundLabelCount == enclosingBoundLabels.length) {
+                        enclosingBoundLabels = Arrays.copyOf(enclosingBoundLabels, Math.max(4, enclosingBoundLabelCount * 2));
+                    }
+                    enclosingBoundLabels[enclosingBoundLabelCount++] = label;
+                }
             }
-            Set<CodeLabel> enclosingBoundLabels = boundLabels;
-            boundLabels = Set.of();
             List<Statement> statements = block.statements();
             for (int index = 0; index < statements.size(); index++) {
                 validateStatement(statements.get(index), block);
             }
             for (int index = 0; index < labels.size(); index++) {
-                if (!boundLabels.contains(labels.get(index))) {
+                if (boundLabels == null || !boundLabels.remove(labels.get(index))) {
                     throw new IllegalArgumentException("Label is not bound: " + labels.get(index).name());
                 }
             }
-            boundLabels = enclosingBoundLabels;
+            while (enclosingBoundLabelCount > enclosingBoundLabelMark) {
+                enclosingBoundLabelCount--;
+                boundLabels.add(enclosingBoundLabels[enclosingBoundLabelCount]);
+                enclosingBoundLabels[enclosingBoundLabelCount] = null;
+            }
             visibleLabels.restore(labelMark);
             if (!accumulate) {
                 visible.restore(visibleMark);
@@ -1168,11 +1224,18 @@ final class ModelValidator
                     if (different(binding.label().owner(), currentBlock.scope())) {
                         throw new IllegalArgumentException("Label binding belongs to another block: " + binding.label().name());
                     }
-                    if (boundLabels.isEmpty()) {
+                    if (boundLabels == null) {
                         boundLabels = identitySet();
                     }
                     if (!boundLabels.add(binding.label())) {
                         throw new IllegalArgumentException("Label is bound more than once: " + binding.label().name());
+                    }
+                    if (pendingJumpCount != 0) {
+                        int position = visibleLabels.position(binding.label());
+                        if (position < pendingJumps.length) {
+                            pendingJumpCount -= pendingJumps[position];
+                            pendingJumps[position] = 0;
+                        }
                     }
                 }
                 case Statements.Jump jump -> {
@@ -1185,12 +1248,21 @@ final class ModelValidator
                     if (stackedFinallyReturn != null && !visibleLabels.addedSince(jump.target(), stackedFinallyLabelMark)) {
                         throw stackedFinallyJumpException(" to label " + jump.target().name());
                     }
+                    if (boundLabels == null || !boundLabels.contains(jump.target())) {
+                        int position = visibleLabels.position(jump.target());
+                        if (position >= pendingJumps.length) {
+                            pendingJumps = Arrays.copyOf(pendingJumps, Math.max(8, visibleLabels.mark() * 2));
+                        }
+                        pendingJumps[position]++;
+                        pendingJumpCount++;
+                    }
                 }
                 case Statements.Declaration declaration -> {
                     if (different(declaration.variable().owner(), currentBlock.scope())) {
                         throw new IllegalArgumentException("Variable declaration belongs to another block: " + declaration.variable().name());
                     }
                     visible.add(declaration.variable());
+                    trackedDeclarations++;
                 }
                 case Statements.InitializedDeclaration declaration -> {
                     if (different(declaration.variable().owner(), currentBlock.scope())) {
@@ -1198,6 +1270,19 @@ final class ModelValidator
                     }
                     validateExpression(declaration.initializer());
                     visible.add(declaration.variable());
+                    // A pending jump, including one in the initializer, can skip the declaration.
+                    initializedDeclarations++;
+                    if (setupDepth > 0) {
+                        skippableSetupDeclarations |= pendingJumpCount != 0;
+                    }
+                    else if (pendingJumpCount != 0) {
+                        if (skippableDeclarations.isEmpty()) {
+                            skippableDeclarations = identitySet();
+                        }
+                        if (skippableDeclarations.add(declaration.variable())) {
+                            trackedDeclarations++;
+                        }
+                    }
                 }
                 case CodeBlock block -> validateBlock(block, false);
                 case IfStatement ifStatement -> {
@@ -1436,12 +1521,14 @@ final class ModelValidator
                         }
                         // Setup declarations stay visible to the value until the expansion exits.
                         int visibleMark = visible.mark();
+                        setupDepth++;
                         if (itemStacked) {
                             validateStackedSetup(synthetic, plan.setup());
                         }
                         else {
                             validateBlock(plan.setup(), true);
                         }
+                        setupDepth--;
                         // The emitter pushes a synthetic's value even where it branches on the synthetic.
                         push(new SyntheticExit(synthetic, visibleMark), false, false);
                         push(plan.value(), itemStacked, false);
@@ -1583,11 +1670,16 @@ final class ModelValidator
             return elements.containsKey(element);
         }
 
-        // Whether the element was added at or after the mark; the set must track positions.
+        // The position of a contained element in the order of additions; the set must track positions.
+        private int position(T element)
+        {
+            return elements.get(element);
+        }
+
+        // Whether a contained element was added at or after the mark; the set must track positions.
         private boolean addedSince(T element, int mark)
         {
-            Integer position = elements.get(element);
-            return position != null && position >= mark;
+            return position(element) >= mark;
         }
 
         private int mark()

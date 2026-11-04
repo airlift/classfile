@@ -912,6 +912,18 @@ propagates. Code that takes the bytes and defines them some other way can call
 class hierarchy without the unit's generated types, so it can report "Could not resolve
 class" for a class whose verification needs them.
 
+Model validation rejects control-flow errors the verifier would otherwise report against
+the emitted bytes. A local read on a path that never assigned it fails with `Variable
+x might not have been initialized`, and a method other than a class initializer whose
+body can complete without a return or throw fails with `Method can complete without
+returning`. The check follows the control flow the compiler emits, so a literal
+`true` loop condition or a short-circuit condition counts the way Java's
+definite-assignment rules do. The model is built for structured code, as it is for
+structured use of the operand stack, so it does not support two patterns the verifier
+allows. A value left in a reused slot by an earlier scope does not count as an
+assignment, even when its type matches. Copying an unassigned local, as in `y = x`, is
+itself a read of an unassigned local.
+
 A synthetic expression's setup runs where the expression is evaluated, so when an
 earlier operand of the same statement is already on the operand stack, such as the
 receiver or a previous argument of a call, the setup runs above it. An exception

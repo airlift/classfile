@@ -19,10 +19,13 @@ import java.lang.constant.ClassDesc;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 import static io.airlift.classfile.BytecodeExpressions.constantDouble;
 import static io.airlift.classfile.BytecodeExpressions.constantInt;
 import static io.airlift.classfile.BytecodeExpressions.constantString;
+import static io.airlift.classfile.BytecodeExpressions.constantTrue;
+import static io.airlift.classfile.BytecodeExpressions.invokeStatic;
 import static io.airlift.classfile.CodeBlock.block;
 import static io.airlift.classfile.CodeBlock.blockBuilder;
 import static java.lang.constant.ConstantDescs.CD_double;
@@ -464,6 +467,194 @@ class TestStructuredControlFlow
     }
 
     @Test
+    void testReadBeforeDefiniteAssignmentIsRejected()
+    {
+        assertUninitializedRead((body, _, x) -> body.ret(x));
+        assertUninitializedRead((body, condition, x) -> body
+                .append(IfStatement.builder().condition(condition).then(x.set(constantInt(1))).build())
+                .ret(x));
+        assertUninitializedRead((body, condition, x) -> body
+                .append(WhileLoop.builder().condition(condition).body(x.set(constantInt(1))).build())
+                .ret(x));
+        assertUninitializedRead((body, _, x) -> body
+                .append(TryCatch.builder()
+                        .tryBlock(x.set(invokeStatic(Integer.class, "parseInt", int.class, constantString("1"))))
+                        .catching(NumberFormatException.class, "failure", (catchBody, _) -> catchBody.ret(x))
+                        .build())
+                .ret(x));
+        // The finally copy inlined before the early return reads x before the try assigns it.
+        assertUninitializedRead((body, condition, x) -> body
+                .append(TryCatch.builder()
+                        .tryBlock(block(
+                                IfStatement.builder().condition(condition).then(constantInt(0).ret()).build(),
+                                x.set(constantInt(1))))
+                        .finallyBlock(x.pop())
+                        .build())
+                .ret(x));
+        assertUninitializedRead((body, condition, x) -> {
+            CodeLabel skip = body.label("skip");
+            body.append(IfStatement.builder().condition(condition).then(blockBuilder().jump(skip).build()).build())
+                    .append(x.set(constantInt(1)))
+                    .mark(skip)
+                    .ret(x);
+        });
+        // A jump past a declaration with an initializer skips its store, as does a jump in the initializer.
+        assertUninitializedRead((body, _) -> {
+            CodeLabel done = body.label("done");
+            body.jump(done);
+            Variable x = body.declare("x", constantInt(42));
+            body.mark(done).ret(x);
+        });
+        assertUninitializedRead((body, _) -> {
+            CodeLabel done = body.label("done");
+            Variable x = body.declare("x", synthetic(blockBuilder().jump(done).build(), constantInt(42)));
+            body.mark(done).ret(x);
+        });
+        // A setup the emitter places as a value block stores a copy of a local instead of aliasing it.
+        assertUninitializedRead((body, condition) -> {
+            CodeBlock.Builder setup = blockBuilder();
+            Variable result = setup.declare(boolean.class, "result");
+            CodeLabel done = setup.label("done");
+            setup.jump(done);
+            Variable x = setup.declare("x", condition);
+            setup.mark(done).append(result.set(x));
+            body.append(synthetic(setup.build(), result).pop()).ret(constantInt(0));
+        });
+        // The 65th variable is past the first word of the state.
+        assertUninitializedRead((body, condition) -> {
+            for (int index = 0; index < 64; index++) {
+                body.declare(CD_int, "unused" + index);
+            }
+            Variable x = body.declare(CD_int, "x");
+            body.append(IfStatement.builder().condition(condition).then(x.set(constantInt(1))).build()).ret(x);
+        });
+    }
+
+    @Test
+    void testDefiniteAssignmentFollowsEmittedControlFlow()
+            throws Exception
+    {
+        ClassDefinition classDefinition = generatedClass("DefiniteAssignment");
+        Parameter input = Parameter.arg("input", int.class);
+        MethodDefinition method = classDefinition.method("value", CD_int, input).access(PUBLIC, STATIC);
+        CodeBlock.Builder body = method.body();
+        Variable selected = body.declare(CD_int, "selected");
+        body.append(SwitchStatement.builder()
+                .expression(input)
+                .caseValue(1, selected.set(constantInt(10)))
+                .defaultCase(selected.set(constantInt(20)))
+                .build());
+        // Only the break leaves a constant-true loop, so the break carries the assignment.
+        Variable looped = body.declare(CD_int, "looped");
+        WhileLoop.Builder loop = WhileLoop.builder();
+        body.append(loop.condition(constantTrue()).body(block(looped.set(constantInt(300)), loop.breakLoop())).build());
+        Variable parsed = body.declare(CD_int, "parsed");
+        body.append(TryCatch.builder()
+                .tryBlock(parsed.set(invokeStatic(Integer.class, "parseInt", int.class, constantString("x"))))
+                .catching(NumberFormatException.class, "failure", (catchBody, _) -> catchBody.append(parsed.set(constantInt(4000))))
+                .build());
+        body.ret(selected.add(looped).add(parsed));
+        // The JDK replaces this unreachable read before verification.
+        Variable dead = body.declare(CD_int, "dead");
+        body.ret(dead);
+
+        // Each placement of a block binds its own labels: the finally copy after the return, a block
+        // appended twice, the setup of a synthetic expression used twice, and a snapshot appended to
+        // a later snapshot of its builder, whose jump skips an assignment.
+        CodeBlock.Builder labeledBuilder = blockBuilder();
+        labeledBuilder.mark(labeledBuilder.label("done"));
+        CodeBlock labeled = labeledBuilder.build();
+        classDefinition.method("finallyLabel", CD_int).access(PUBLIC, STATIC).body()
+                .append(TryCatch.builder().tryBlock(constantInt(1).ret()).finallyBlock(labeled).build());
+        CodeBlock.Builder repeatedBlock = classDefinition.method("repeatedBlock", CD_int).access(PUBLIC, STATIC).body();
+        Variable afterBlock = repeatedBlock.declare(CD_int, "afterBlock");
+        repeatedBlock.append(labeled).append(afterBlock.set(constantInt(2))).append(labeled).ret(afterBlock);
+        CodeBlock.Builder repeatedSynthetic = classDefinition.method("repeatedSynthetic", CD_int).access(PUBLIC, STATIC).body();
+        Variable afterSynthetic = repeatedSynthetic.declare(CD_int, "afterSynthetic");
+        SyntheticExpression labeledSetup = synthetic(labeled, constantInt(0));
+        repeatedSynthetic.append(labeledSetup.pop()).append(afterSynthetic.set(constantInt(3))).append(labeledSetup.pop()).ret(afterSynthetic);
+        CodeBlock.Builder nestedSnapshot = classDefinition.method("nestedSnapshot", CD_int).access(PUBLIC, STATIC).body();
+        Variable snapshotResult = nestedSnapshot.declare("snapshotResult", constantInt(7));
+        CodeBlock.Builder snapshotBuilder = blockBuilder();
+        CodeLabel snapshotDone = snapshotBuilder.label("done");
+        snapshotBuilder.jump(snapshotDone).append(snapshotResult.set(constantInt(8))).mark(snapshotDone);
+        snapshotBuilder.append(snapshotBuilder.build());
+        nestedSnapshot.append(snapshotBuilder.build()).ret(snapshotResult);
+
+        // An alias of a local emits no store, so jumping past it still reads its source.
+        Parameter aliased = Parameter.arg("aliased", int.class);
+        CodeBlock.Builder skippedAlias = classDefinition.method("skippedAlias", CD_int, aliased).access(PUBLIC, STATIC).body();
+        CodeLabel aliasDone = skippedAlias.label("done");
+        skippedAlias.jump(aliasDone);
+        Variable alias = skippedAlias.declare("alias", aliased);
+        Variable aliasOfAlias = skippedAlias.declare("aliasOfAlias", alias);
+        skippedAlias.mark(aliasDone).ret(aliasOfAlias);
+        // A setup whose value is not its result variable is an ordinary block, which aliases.
+        Parameter setupInput = Parameter.arg("setupInput", int.class);
+        CodeBlock.Builder setup = blockBuilder();
+        Variable setupResult = setup.declare(CD_int, "setupResult");
+        CodeLabel setupDone = setup.label("done");
+        setup.jump(setupDone);
+        Variable setupAlias = setup.declare("setupAlias", setupInput);
+        setup.mark(setupDone).append(setupResult.set(setupAlias));
+        classDefinition.method("syntheticAlias", CD_int, setupInput).access(PUBLIC, STATIC).body()
+                .ret(synthetic(setup.build(), setupResult.add(constantInt(0))));
+
+        // The 65th variable is past the first word of the state.
+        Parameter flag = Parameter.arg("flag", boolean.class);
+        CodeBlock.Builder wideJoin = classDefinition.method("wideJoin", CD_int, flag).access(PUBLIC, STATIC).body();
+        for (int index = 0; index < 64; index++) {
+            wideJoin.declare(CD_int, "unused" + index);
+        }
+        Variable joined = wideJoin.declare(CD_int, "joined");
+        wideJoin.append(IfStatement.builder().condition(flag).then(joined.set(constantInt(4))).otherwise(joined.set(constantInt(5))).build()).ret(joined);
+
+        Class<?> generated = define(classDefinition.build());
+        assertThat(generated.getMethod("value", int.class).invoke(null, 1)).isEqualTo(4310);
+        assertThat(generated.getMethod("finallyLabel").invoke(null)).isEqualTo(1);
+        assertThat(generated.getMethod("repeatedBlock").invoke(null)).isEqualTo(2);
+        assertThat(generated.getMethod("repeatedSynthetic").invoke(null)).isEqualTo(3);
+        assertThat(generated.getMethod("nestedSnapshot").invoke(null)).isEqualTo(7);
+        assertThat(generated.getMethod("skippedAlias", int.class).invoke(null, 37)).isEqualTo(37);
+        assertThat(generated.getMethod("syntheticAlias", int.class).invoke(null, 38)).isEqualTo(38);
+        assertThat(generated.getMethod("wideJoin", boolean.class).invoke(null, true)).isEqualTo(4);
+    }
+
+    @Test
+    void testMethodThatCanCompleteWithoutReturningIsRejected()
+    {
+        ClassDefinition voidMethod = generatedClass("VoidFallthrough");
+        voidMethod.method("run", void.class).access(PUBLIC, STATIC).body().append(constantInt(1).pop());
+        assertThatThrownBy(voidMethod::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Method can complete without returning: public static void run()");
+
+        ClassDefinition breakOut = generatedClass("BreakFallthrough");
+        WhileLoop.Builder loop = WhileLoop.builder();
+        breakOut.method("value", CD_int).access(PUBLIC, STATIC).body()
+                .append(loop.condition(constantTrue()).body(loop.breakLoop()).build());
+        assertThatThrownBy(breakOut::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Method can complete without returning: public static int value()");
+
+        ClassDefinition constructor = generatedClass("ConstructorFallthrough");
+        constructor.constructor().access(PUBLIC).body().invokeSuperConstructor();
+        assertThatThrownBy(constructor::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Method can complete without returning: public " + constructor.type().displayName() + "()");
+
+        // Assigning all 64 variables of the first state word leaves the fallthrough reachable.
+        ClassDefinition wide = generatedClass("WideFallthrough");
+        CodeBlock.Builder wideBody = wide.method("value", CD_int).access(PUBLIC, STATIC).body();
+        for (int index = 0; index < 64; index++) {
+            wideBody.append(wideBody.declare(CD_int, "assigned" + index).set(constantInt(index)));
+        }
+        assertThatThrownBy(wide::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Method can complete without returning: public static int value()");
+    }
+
+    @Test
     void testControlFlowBuilderComponentsAreSetOnce()
     {
         BytecodeExpression condition = constantInt(1).equal(constantInt(1));
@@ -682,6 +873,47 @@ class TestStructuredControlFlow
     {
         ClassDesc type = ClassDesc.of(getClass().getPackageName() + ".Generated" + suffix + NEXT_CLASS_ID.incrementAndGet());
         return ClassDefinition.define(type).access(PUBLIC, FINAL);
+    }
+
+    private void assertUninitializedRead(UninitializedRead read)
+    {
+        assertUninitializedRead((body, condition) -> read.build(body, condition, body.declare(CD_int, "x")));
+    }
+
+    // The read variable is named x.
+    private void assertUninitializedRead(BiConsumer<CodeBlock.Builder, Parameter> read)
+    {
+        ClassDefinition classDefinition = generatedClass("UninitializedRead");
+        Parameter condition = Parameter.arg("condition", boolean.class);
+        MethodDefinition method = classDefinition.method("value", CD_int, condition).access(PUBLIC, STATIC);
+        read.accept(method.body(), condition);
+        assertThatThrownBy(classDefinition::build)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Variable x might not have been initialized: public static int value(boolean condition)");
+    }
+
+    private interface UninitializedRead
+    {
+        void build(CodeBlock.Builder body, Parameter condition, Variable x);
+    }
+
+    private static SyntheticExpression synthetic(CodeBlock setup, BytecodeExpression value)
+    {
+        ExpressionPlan plan = new ExpressionPlan(setup, value);
+        return new SyntheticExpression()
+        {
+            @Override
+            public ClassDesc type()
+            {
+                return value.type();
+            }
+
+            @Override
+            public ExpressionPlan expansion(ExpansionContext context)
+            {
+                return plan;
+            }
+        };
     }
 
     private Class<?> define(ClassModel definition)

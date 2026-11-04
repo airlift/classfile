@@ -600,6 +600,12 @@ Finalizing or compiling a method validates the complete placement graph:
 - break and continue target appropriate enclosing structures;
 - labels have valid and unambiguous binding points;
 - return values match the method return type;
+- every local is definitely assigned before each read, judged over the control flow
+  the compiler emits: literal conditions fold and short circuits branch as the emitter
+  does, a catch handler starts from the state on entry to its try block, and each
+  inlined finally copy sees the state at the exit it runs for;
+- every reachable path through a method other than a class initializer ends in a
+  return or throw;
 - constructors invoke exactly one valid `super(...)` or `this(...)` on every
   reachable continuing path before ordinary receiver use or return;
 - every `this(...)` target exists in the completed class and constructor delegation
@@ -625,6 +631,12 @@ selected by the target loader or lookup. Failures identify the generated class a
 model path before class definition. Runtime-bound method handles are the deliberate
 exception: their original signatures are input to target adaptation rather than
 ordinary symbolic references.
+
+These rules describe the code the model supports, not every class the verifier accepts.
+The model is built for structured code, just as it is built for structured use of the
+operand stack rather than arbitrary stack manipulation. A value an earlier scope left in
+a reused slot does not assign a later local, even of the same type, and copying an
+unassigned local, as in `y = x`, is an unassigned read.
 
 The validator may memoize context-free properties, but it must not use a global
 identity-based visited set for context-sensitive placement validation.

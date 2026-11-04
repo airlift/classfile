@@ -1186,8 +1186,9 @@ class TestRuntimeDefiners
     private static MethodDefinition unverifiableEvaluate(ClassDefinition definition)
     {
         MethodDefinition evaluate = definition.method("evaluate", CD_int).access(PUBLIC, STATIC);
-        // Model validation does not check definite assignment, so only the verifier rejects this uninitialized read.
-        evaluate.body().ret(evaluate.body().declare(int.class, "x"));
+        // Model validation leaves reference assignability to the verifier, so only the verifier rejects this receiver.
+        Variable value = evaluate.body().declare("value", constantString("x").cast(Object.class));
+        evaluate.body().ret(value.invokeVirtual(classDesc(Number.class), "intValue", MethodTypeDesc.of(CD_int)));
         return evaluate;
     }
 
