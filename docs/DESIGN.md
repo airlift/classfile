@@ -609,6 +609,12 @@ Finalizing or compiling a method validates the complete placement graph:
 - record fields, accessors, canonical construction, secondary construction, and
   object methods satisfy Java record invariants;
 - synthetic expansions satisfy the same capture and scope rules;
+- a synthetic setup evaluated while operands of its statement are already on the
+  operand stack stays at that stack depth: it catches exceptions only when no catch
+  block can complete normally, it does not jump to a label or loop outside the setup
+  or out of one of its catch or finally blocks, and each enclosing finally block that
+  a return from the setup, other than from one of its catch blocks, runs follows the
+  same rules within itself;
 - repeated placements are validated independently;
 - the definition graph has no cycles.
 

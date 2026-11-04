@@ -912,6 +912,18 @@ propagates. Code that takes the bytes and defines them some other way can call
 class hierarchy without the unit's generated types, so it can report "Could not resolve
 class" for a class whose verification needs them.
 
+A synthetic expression's setup runs where the expression is evaluated, so when an
+earlier operand of the same statement is already on the operand stack, such as the
+receiver or a previous argument of a call, the setup runs above it. An exception
+handler starts on an empty operand stack, so such a setup can catch exceptions only when
+no catch block can complete normally, for example each ends in a throw or return, and it
+cannot jump to a label or loop outside itself or out of one of its catch or finally
+blocks. A return from the setup, other than from one of its catch blocks, runs each
+enclosing finally block above the operands, so those blocks follow the same rules.
+Model validation rejects a setup that breaks them with a message naming the synthetic
+expression. Evaluate the synthetic expression first, for example into a variable, and
+use the variable as the operand.
+
 Logical descriptions improve model dumps. Source-derived helper names make physical
 reports, disassembly, and production stack traces easier to interpret.
 
