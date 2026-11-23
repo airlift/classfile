@@ -578,7 +578,17 @@ final class StatementPlanner
             LinkedHashSet<Variable> writes = new LinkedHashSet<>();
             blocks.forEach(block -> collectWrittenVariables(block, writes));
             writes.removeAll(declarations);
-            if (writes.size() < 2 || writes.stream().anyMatch(variable -> !hasInitializer(method.body(), variable))) {
+            // an uninitialized outer local is scratch when every block assigns it before reading it
+            // and the return value does not read it
+            LinkedHashSet<Variable> scratch = writes.stream()
+                    .filter(variable -> !hasInitializer(method.body(), variable))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            if (scratch.stream().anyMatch(variable -> ExpressionPlanner.locals(returnValue.orElseThrow()).stream().anyMatch(local -> same(local, variable)) ||
+                    blocks.stream().anyMatch(block -> isLiveAtStart(List.of(block), List.of(), variable)))) {
+                return Optional.empty();
+            }
+            writes.removeAll(scratch);
+            if (writes.size() < 2) {
                 return Optional.empty();
             }
 
@@ -586,6 +596,7 @@ final class StatementPlanner
             blocks.forEach(block -> locals.addAll(ExpressionPlanner.locals(block)));
             locals.addAll(ExpressionPlanner.locals(returnValue.orElseThrow()));
             locals.removeAll(declarations);
+            locals.removeAll(scratch);
             Optional<Variable> receiver = hiddenReceiver(method, locals);
             if (hasUnsupportedOwnerLocal(locals, receiver)) {
                 return Optional.empty();
@@ -653,7 +664,12 @@ final class StatementPlanner
 
                 LinkedHashSet<Variable> regionWrites = new LinkedHashSet<>();
                 region.forEach(block -> collectWrittenVariables(block, regionWrites));
+                LinkedHashSet<Variable> regionScratch = new LinkedHashSet<>(regionWrites);
+                regionScratch.retainAll(scratch);
                 regionWrites.retainAll(writes);
+                for (Variable variable : regionScratch) {
+                    replacements.put(variable, helper.body().declare(variable.type(), sanitize(variable.name()) + "State"));
+                }
                 LinkedHashMap<String, Integer> localNames = new LinkedHashMap<>();
                 for (Variable variable : regionWrites) {
                     String base = sanitize(variable.name()) + "State";
@@ -906,10 +922,17 @@ final class StatementPlanner
             LinkedHashSet<Variable> writes = new LinkedHashSet<>();
             region.forEach(block -> collectWrittenVariables(block, writes));
             writes.removeAll(declarations);
-            if (writes.stream().anyMatch(variable -> !hasInitializer(method.body(), variable))) {
+            // an uninitialized outer local is helper-local scratch when the region assigns it before
+            // any read and nothing after the region reads the value
+            LinkedHashSet<Variable> scratch = writes.stream()
+                    .filter(variable -> !hasInitializer(method.body(), variable))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            if (scratch.stream().anyMatch(variable -> region.stream().anyMatch(block -> isLiveAtStart(List.of(block), List.of(), variable)) || !isScratchAfter(liveAfter, liveAfterBody, variable))) {
                 return Optional.empty();
             }
+            locals.removeAll(scratch);
             LinkedHashSet<Variable> liveWrites = writes.stream()
+                    .filter(variable -> !scratch.contains(variable))
                     .filter(variable -> isLiveAtStart(liveAfter, liveAfterBody, variable))
                     .collect(Collectors.toCollection(LinkedHashSet::new));
             if (liveWrites.size() > 1) {
@@ -953,8 +976,11 @@ final class StatementPlanner
                 Variable helperOutput = helper.body().declare("result", replacements.get(variable));
                 replacements.put(variable, helperOutput);
             });
+            for (Variable variable : scratch) {
+                replacements.put(variable, helper.body().declare(variable.type(), sanitize(variable.name()) + "State"));
+            }
             for (Variable variable : writes) {
-                if (output.filter(value -> same(value, variable)).isPresent()) {
+                if (scratch.contains(variable) || output.filter(value -> same(value, variable)).isPresent()) {
                     continue;
                 }
                 Variable helperLocal = helper.body().declare(sanitize(variable.name()) + "State", replacements.get(variable));
@@ -1455,6 +1481,26 @@ final class StatementPlanner
                  Statements.Jump _,
                  Statements.LabelBinding _ -> {}
         }
+    }
+
+    // The variable holds no value that later code observes: every later scoped block assigns it
+    // before reading it, and no other later statement touches it.
+    private static boolean isScratchAfter(List<Statement> statements, List<? extends LocalValue> liveAfterStatements, Variable variable)
+    {
+        if (liveAfterStatements.stream().anyMatch(local -> same(local, variable))) {
+            return false;
+        }
+        for (Statement statement : statements) {
+            if (statement instanceof CodeBlock block) {
+                if (isLiveAtStart(List.of(block), List.of(), variable)) {
+                    return false;
+                }
+            }
+            else if (firstAccess(statement, variable) != FirstAccess.NONE) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static boolean isLiveAtStart(

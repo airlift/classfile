@@ -91,6 +91,67 @@ class TestScopedBlockOutputSplitting
     }
 
     @Test
+    void testScratchLocalDeclaredWithoutInitializerDoesNotBlockSplit()
+            throws ReflectiveOperationException
+    {
+        assertScratchSplit("$blocks$", false);
+    }
+
+    @Test
+    void testScratchLocalDeclaredWithoutInitializerDoesNotBlockTrailingContinuation()
+            throws ReflectiveOperationException
+    {
+        assertScratchSplit("$continuation$", true);
+    }
+
+    private static void assertScratchSplit(String helperMarker, boolean twoOutputs)
+            throws ReflectiveOperationException
+    {
+        ClassDefinition definition = ClassDefinition.define(TestScopedBlockOutputSplitting.class)
+                .access(PUBLIC, FINAL)
+                .addInterface(IntUnaryOperator.class);
+        definition.defaultConstructor().access(PUBLIC);
+
+        Parameter input = arg("input", int.class);
+        MethodDefinition apply = definition.method("applyAsInt", int.class, input).access(PUBLIC);
+        Variable first = apply.body().declare("first", input);
+        Variable second = apply.body().declare("second", input);
+        // assigned in every block before it is read, so it can become a helper-local value
+        Variable scratch = apply.body().declare(int.class, "scratch");
+        for (int index = 0; index < 100; index++) {
+            CodeBlock.Builder field = blockBuilder();
+            field.append(scratch.set(input.add(constantInt(index))));
+            field.append(first.set(first.add(scratch)));
+            if (twoOutputs) {
+                field.append(second.set(second.add(scratch)));
+            }
+            apply.body().append(field.build());
+        }
+        apply.body().ret(twoOutputs ? first.add(second) : first);
+
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(MethodHandles.lookup()).build();
+        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
+                .policy(SPLITTING_POLICY)
+                .compileUnit(definition.build());
+        assertThat(unit.report().classes().stream()
+                .flatMap(classInfo -> classInfo.methods().stream())
+                .filter(method -> method.name().contains(helperMarker)))
+                .isNotEmpty();
+        IntUnaryOperator operator = definer.defineUnit(unit)
+                .primaryClass(IntUnaryOperator.class)
+                .getConstructor()
+                .newInstance();
+
+        int expectedFirst = 3;
+        int expectedSecond = 3;
+        for (int index = 0; index < 100; index++) {
+            expectedFirst += 3 + index;
+            expectedSecond += 3 + index;
+        }
+        assertThat(operator.applyAsInt(3)).isEqualTo(twoOutputs ? expectedFirst + expectedSecond : expectedFirst);
+    }
+
+    @Test
     void testTrailingScopedBlocksWithMultipleOutputsSplit()
             throws ReflectiveOperationException
     {

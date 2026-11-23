@@ -385,7 +385,10 @@ the region before being overwritten. The helper returns that one live result to 
 caller. Other written locals become helper-local scratch values because the caller
 overwrites them before any read. Conditional writes and control transfers are treated
 conservatively; a value is dead only when every path overwrites it before a read.
-Regions that assign an uninitialized outer local or produce more than one live local
+An outer local declared without an initializer is helper-local scratch when every region
+and every later scoped block assigns it before reading it and no other later statement
+touches it, so a shared temporary such as a per-field hash value does not block extraction.
+Regions that assign any other uninitialized outer local or produce more than one live local
 remain in place. Mutations visible through a captured reference, such as filling an
 array or invoking a mutating method, do not need a returned value and remain eligible.
 
@@ -411,7 +414,9 @@ method -> continuation3(hash, offset)
 
 This carries multiple values without a tuple, array, record, or other allocation.
 It preserves statement order and applies only to normally completing blocks directly
-before a value return. A non-trailing region, a void method, an uninitialized output,
+before a value return. An uninitialized outer local that every block assigns before reading, and the
+return value does not read, is scratch inside each helper. A non-trailing region, a void method,
+an uninitialized output that is read later,
 unsupported control flow, an owner-typed hidden-class local, or a descriptor above
 255 slots remains in the logical method.
 
