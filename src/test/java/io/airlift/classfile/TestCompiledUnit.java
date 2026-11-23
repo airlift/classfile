@@ -27,6 +27,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -34,7 +35,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static io.airlift.classfile.BytecodeExpressions.boundConstant;
 import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.BytecodeExpressions.constantClass;
 import static io.airlift.classfile.BytecodeExpressions.constantDynamic;
@@ -66,6 +69,55 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestCompiledUnit
 {
     private static final AtomicLong NEXT_ID = new AtomicLong();
+
+    @Test
+    void testRebindReplacesBoundConstants()
+            throws Throwable
+    {
+        Object first = new Object();
+        Object second = new Object();
+        ClassDesc type = ClassDesc.of(getClass().getPackageName() + ".GeneratedRebind" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        definition.method("value", Object.class).access(PUBLIC, STATIC)
+                .body()
+                .ret(boundConstant(first, Object.class));
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileUnit(definition.build());
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(lookup).build();
+
+        assertThat(value(definer.defineUnit(unit))).isSameAs(first);
+        CompiledUnit rebound = unit.rebind(value -> {
+            assertThat(value).isSameAs(first);
+            return second;
+        });
+        assertThat(value(definer.defineUnit(rebound))).isSameAs(second);
+        // the original unit is unchanged and its classfile is shared
+        assertThat(value(definer.defineUnit(unit))).isSameAs(first);
+        assertThat(rebound.classfile(type)).isEqualTo(unit.classfile(type));
+        assertThat(rebound.report()).isSameAs(unit.report());
+
+        // a replacement of the wrong type fails when the constant is used
+        ClassDesc integerType = ClassDesc.of(getClass().getPackageName() + ".GeneratedRebind" + NEXT_ID.incrementAndGet());
+        ClassDefinition integerDefinition = ClassDefinition.define(integerType).access(PUBLIC, FINAL);
+        integerDefinition.method("value", Object.class).access(PUBLIC, STATIC)
+                .body()
+                .ret(boundConstant(1, Integer.class));
+        CompiledUnit integerUnit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileUnit(integerDefinition.build());
+        DefinedUnit defined = definer.defineUnit(integerUnit.rebind(_ -> "not an Integer"));
+        assertThatThrownBy(() -> value(defined)).isInstanceOf(BootstrapMethodError.class)
+                .hasRootCauseInstanceOf(ClassCastException.class);
+
+        assertThatThrownBy(() -> unit.rebind(_ -> null)).isInstanceOf(NullPointerException.class);
+    }
+
+    private static Object value(DefinedUnit defined)
+            throws Throwable
+    {
+        MethodHandle handle = defined.primaryLookup().orElseThrow()
+                .findStatic(defined.primaryClass(), "value", MethodType.methodType(Object.class));
+        return handle.invoke();
+    }
 
     @Test
     void testNameFreeGeneratedLinkageForNominalClasses()
@@ -181,7 +233,7 @@ class TestCompiledUnit
 
     @Test
     void testDeepUnsplitExpressionIsValidatedWithoutOverflow()
-            throws Exception
+            throws IllegalAccessException, InterruptedException, InvocationTargetException, NoSuchMethodException
     {
         ClassDesc type = ClassDesc.of(TestCompiledUnit.class.getPackageName() + ".GeneratedDeepUnsplitExpression" + NEXT_ID.incrementAndGet());
         ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
@@ -194,9 +246,24 @@ class TestCompiledUnit
 
         StandardClassDefiner definer = StandardClassDefiner.builder(getClass().getClassLoader()).build();
         CompilationPolicy policy = new CompilationPolicy(65_535, 65_535, 35, 325, false);
-        CompiledUnit unit = ClassCompiler.forTarget(definer.compilationTarget())
-                .policy(policy)
-                .compileUnit(definition.build());
+        // Emission of an unsplit expression recurses once per nesting level, so the depth it survives depends on
+        // the JVM's JIT state and default stack size. Compile on a thread with a known stack to keep the test stable.
+        AtomicReference<CompiledUnit> compiled = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread thread = new Thread(null, () -> {
+            try {
+                compiled.set(ClassCompiler.forTarget(definer.compilationTarget())
+                        .policy(policy)
+                        .compileUnit(definition.build()));
+            }
+            catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "deep-expression-compile", 64L * 1024 * 1024);
+        thread.start();
+        thread.join();
+        assertThat(failure.get()).isNull();
+        CompiledUnit unit = compiled.get();
         Class<?> generated = definer.defineUnit(unit).primaryClass();
 
         assertThat(unit.report().classes().stream()
