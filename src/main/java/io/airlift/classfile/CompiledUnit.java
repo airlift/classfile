@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 import static java.util.Objects.requireNonNull;
 
@@ -88,6 +89,27 @@ public final class CompiledUnit
     public List<ClassDesc> definitionOrder()
     {
         return definitionOrder;
+    }
+
+    /// Returns a unit with the same classfiles, linkage, and report whose bound constants are replaced
+    /// by the mapper's result.
+    ///
+    /// The mapper receives each value supplied to `boundConstant(...)` or `boundMethodHandle(...)`
+    /// once per physical class that holds it, and must return a non-null replacement. Generated-method
+    /// links and caller-supplied class data are unchanged. The replacement must have the type the
+    /// generated code expects; a mismatch fails with a `BootstrapMethodError` when the defined class
+    /// first uses the constant.
+    ///
+    /// This lets one compilation serve many definitions that differ only in their bound values, such
+    /// as a cached template instantiated for different literals. Define the result as a hidden unit;
+    /// nominal classes cannot be defined twice in one class loader.
+    public CompiledUnit rebind(UnaryOperator<Object> mapper)
+    {
+        requireNonNull(mapper, "mapper is null");
+        List<Artifact> rebound = artifacts.values().stream()
+                .map(artifact -> artifact.rebind(mapper))
+                .toList();
+        return new CompiledUnit(target, primaryType, rebound, report);
     }
 
     /// Returns generated methods owned by a physical type that must be linked before callers of
@@ -248,6 +270,17 @@ public final class CompiledUnit
             if (!type.equals(classInfo.type())) {
                 throw new IllegalArgumentException("Class info type does not match artifact type");
             }
+        }
+
+        Artifact rebind(UnaryOperator<Object> mapper)
+        {
+            List<Binding> mapped = bindings.stream()
+                    .<Binding>map(binding -> switch (binding) {
+                        case ValueBinding value -> new ValueBinding(mapper.apply(value.value()));
+                        case MethodBinding method -> method;
+                    })
+                    .toList();
+            return new Artifact(type, classfile, classData, mapped, classDataTypes, lambdaFactoryRequired, classInfo);
         }
 
         ClassDesc type()

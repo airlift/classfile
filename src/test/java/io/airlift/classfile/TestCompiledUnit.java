@@ -35,6 +35,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.airlift.classfile.BytecodeExpressions.boundConstant;
 import static io.airlift.classfile.BytecodeExpressions.boundMethodHandle;
 import static io.airlift.classfile.BytecodeExpressions.constantClass;
 import static io.airlift.classfile.BytecodeExpressions.constantDynamic;
@@ -66,6 +67,55 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestCompiledUnit
 {
     private static final AtomicLong NEXT_ID = new AtomicLong();
+
+    @Test
+    void testRebindReplacesBoundConstants()
+            throws Throwable
+    {
+        Object first = new Object();
+        Object second = new Object();
+        ClassDesc type = ClassDesc.of(getClass().getPackageName() + ".GeneratedRebind" + NEXT_ID.incrementAndGet());
+        ClassDefinition definition = ClassDefinition.define(type).access(PUBLIC, FINAL);
+        definition.method("value", Object.class).access(PUBLIC, STATIC)
+                .body()
+                .ret(boundConstant(first, Object.class));
+
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        CompiledUnit unit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileUnit(definition.build());
+        HiddenClassDefiner definer = HiddenClassDefiner.builder(lookup).build();
+
+        assertThat(value(definer.defineUnit(unit))).isSameAs(first);
+        CompiledUnit rebound = unit.rebind(value -> {
+            assertThat(value).isSameAs(first);
+            return second;
+        });
+        assertThat(value(definer.defineUnit(rebound))).isSameAs(second);
+        // the original unit is unchanged and its classfile is shared
+        assertThat(value(definer.defineUnit(unit))).isSameAs(first);
+        assertThat(rebound.classfile(type)).isEqualTo(unit.classfile(type));
+        assertThat(rebound.report()).isSameAs(unit.report());
+
+        // a replacement of the wrong type fails when the constant is used
+        ClassDesc integerType = ClassDesc.of(getClass().getPackageName() + ".GeneratedRebind" + NEXT_ID.incrementAndGet());
+        ClassDefinition integerDefinition = ClassDefinition.define(integerType).access(PUBLIC, FINAL);
+        integerDefinition.method("value", Object.class).access(PUBLIC, STATIC)
+                .body()
+                .ret(boundConstant(1, Integer.class));
+        CompiledUnit integerUnit = ClassCompiler.forTarget(CompilationTarget.forLookup(lookup)).compileUnit(integerDefinition.build());
+        DefinedUnit defined = definer.defineUnit(integerUnit.rebind(_ -> "not an Integer"));
+        assertThatThrownBy(() -> value(defined)).isInstanceOf(BootstrapMethodError.class)
+                .hasRootCauseInstanceOf(ClassCastException.class);
+
+        assertThatThrownBy(() -> unit.rebind(_ -> null)).isInstanceOf(NullPointerException.class);
+    }
+
+    private static Object value(DefinedUnit defined)
+            throws Throwable
+    {
+        MethodHandle handle = defined.primaryLookup().orElseThrow()
+                .findStatic(defined.primaryClass(), "value", MethodType.methodType(Object.class));
+        return handle.invoke();
+    }
 
     @Test
     void testNameFreeGeneratedLinkageForNominalClasses()
